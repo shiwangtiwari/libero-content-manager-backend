@@ -55,7 +55,16 @@ async def generate_linkedin_post(prompt: str) -> str:
                 "Re-export CLAUDE_COOKIES from claude.ai and update Railway Variables."
             )
 
-        await asyncio.sleep(1.5)
+        # Wait for the React app to fully render after navigation.
+        # claude.ai is a SPA — domcontentloaded fires on the HTML shell,
+        # but the chat UI takes 3-5 more seconds to render on Railway.
+        await asyncio.sleep(5)
+        
+        # Also wait for network to go idle — confirms React has finished loading
+        try:
+            await page.wait_for_load_state("networkidle", timeout=15_000)
+        except PlaywrightTimeoutError:
+            pass  # networkidle timeout is fine — just means background requests are still running
 
         # ── 3. Find input box — try multiple selectors ────────────────────────
         input_selectors = [
