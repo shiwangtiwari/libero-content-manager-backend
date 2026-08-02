@@ -4,10 +4,15 @@ FastAPI backend entry point.
 
 Startup sequence:
   1. Mount all API routers
-  2. Start APScheduler (posting jobs, missed approval checks)
+  2. Start APScheduler (posting jobs, missed approval checks, content generation)
   3. Start Telegram bot polling loop (only if TELEGRAM_BOT_TOKEN is set)
 
 All runs on Railway. Nothing runs locally.
+
+Phase 3 changes:
+  - scheduler.py now includes Mon/Tue/Wed 6AM content generation jobs
+  - Added /run_now endpoint to manually trigger content pipeline
+  - Added /internal/run_pipeline endpoint
 """
 import logging
 import asyncio
@@ -47,7 +52,10 @@ async def lifespan(app: FastAPI):
             _telegram_app = build_telegram_app()
             await _telegram_app.initialize()
             await _telegram_app.start()
-            await _telegram_app.updater.start_polling(drop_pending_updates=True)
+            await _telegram_app.updater.start_polling(
+                drop_pending_updates=True,
+                allowed_updates=["message"],
+            )
             logger.info("Telegram bot polling started.")
 
             # Send startup notification
@@ -59,6 +67,7 @@ async def lifespan(app: FastAPI):
                 await send_telegram_message(
                     f"🟢 <b>Libero is online</b>\n"
                     f"Started at {ist_now}\n"
+                    f"Phase 3 active — content pipeline ready.\n"
                     f"Send /status to check system health."
                 )
             except Exception as e:
@@ -84,7 +93,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Libero Content Manager — Autonomous Edition",
-    version="1.0.0",
+    version="3.0.0",
     lifespan=lifespan,
 )
 
@@ -112,11 +121,50 @@ app.include_router(internal.router)
 
 @app.get("/")
 async def root():
+    from datetime import datetime
+    import pytz
     return {
         "service": "libero-backend",
+        "phase": "Phase 3 — Content Intelligence",
         "status": "running",
+        "time_ist": datetime.now(pytz.timezone("Asia/Kolkata")).strftime("%Y-%m-%d %H:%M IST"),
         "docs": "/docs",
     }
+
+
+# ── Manual pipeline trigger ───────────────────────────────────────────────────
+
+@app.post("/run_now")
+async def run_pipeline_now(background_tasks: BackgroundTasks):
+    """
+    Manually trigger the content generation pipeline.
+    Equivalent to what the Mon/Tue/Wed 6AM scheduler job does.
+    Use this to test Phase 3 without waiting for Monday.
+    """
+    logger.info("[/run_now] Manual content pipeline trigger")
+    background_tasks.add_task(_run_pipeline_background)
+    return {
+        "ok": True,
+        "message": "Content pipeline triggered. You will receive a Telegram notification with the draft in ~30 seconds.",
+    }
+
+
+async def _run_pipeline_background():
+    try:
+        from services.content_pipeline import run_content_pipeline
+        result = await run_content_pipeline()
+        logger.info(f"[/run_now] Pipeline result: {result}")
+    except Exception as e:
+        logger.error(f"[/run_now] Pipeline failed: {e}", exc_info=True)
+        try:
+            from routers.telegram import send_telegram_message
+            await send_telegram_message(
+                f"❌ <b>Manual pipeline trigger failed</b>\n\n"
+                f"<b>Error:</b> {str(e)[:300]}\n\n"
+                f"Check Railway logs."
+            )
+        except Exception:
+            pass
 
 
 # ── Test endpoints (Phase 1 validation) ──────────────────────────────────────
@@ -143,7 +191,7 @@ async def test_telegram():
 
 @app.get("/test/env")
 async def test_env():
-    """Phase 1 test: verify which env vars are set (values hidden, just presence check)."""
+    """Phase 1 test: verify which env vars are set (values hidden)."""
     def present(val):
         return bool(val)
 
@@ -156,10 +204,10 @@ async def test_env():
         "LINKEDIN_CLIENT_SECRET": present(settings.LINKEDIN_CLIENT_SECRET),
         "LINKEDIN_ACCESS_TOKEN": present(settings.LINKEDIN_ACCESS_TOKEN),
         "LINKEDIN_PERSON_URN": present(settings.LINKEDIN_PERSON_URN),
+        "ANTHROPIC_API_KEY": present(settings.ANTHROPIC_API_KEY),
         "CLAUDE_COOKIES": present(settings.CLAUDE_COOKIES),
         "CHATGPT_COOKIES": present(settings.CHATGPT_COOKIES),
         "GEMINI_COOKIES": present(settings.GEMINI_COOKIES),
-        "ANTHROPIC_API_KEY": present(settings.ANTHROPIC_API_KEY),
     }
 
 
@@ -168,9 +216,8 @@ async def test_env():
 @app.post("/test/claude")
 async def test_claude(background_tasks: BackgroundTasks):
     """
-    Phase 2 validation: calls Anthropic API directly to confirm it works.
+    Phase 2 validation: calls Anthropic API directly.
     Returns Claude's response and sends result to Telegram.
-    Expected response time: 3-5 seconds.
     """
     from datetime import datetime
     import pytz
@@ -234,8 +281,6 @@ async def _notify_telegram_phase2(
     error: str | None = None,
 ):
     """Send Phase 2 test result to Telegram."""
-    import httpx
-
     bot_token = settings.TELEGRAM_BOT_TOKEN
     chat_id = settings.TELEGRAM_CHAT_ID
     if not bot_token or not chat_id:
