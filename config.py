@@ -22,6 +22,15 @@ class Settings(BaseSettings):
     CHATGPT_COOKIES: Optional[str] = None
     GEMINI_COOKIES: Optional[str] = None
 
+    # Anthropic API — for content generation (Phase 2)
+    ANTHROPIC_API_KEY: Optional[str] = None
+
+    # GitHub Actions — for triggering content generation workflows
+    GITHUB_PAT: Optional[str] = None
+    GITHUB_REPO: Optional[str] = None
+    RAILWAY_INTERNAL_SECRET: Optional[str] = None
+    RAILWAY_CALLBACK_URL: Optional[str] = None
+
     # App
     PORT: int = 8000
 
