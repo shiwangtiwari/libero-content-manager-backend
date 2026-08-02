@@ -161,3 +161,119 @@ async def test_env():
         "CHATGPT_COOKIES": present(settings.CHATGPT_COOKIES),
         "GEMINI_COOKIES": present(settings.GEMINI_COOKIES),
     }
+
+# ── Test endpoint (Phase 2 validation) ───────────────────────────────────────
+# ADD THIS BLOCK to the bottom of your existing main.py.
+# Do not replace anything above — just append these lines.
+
+@app.post("/test/claude")
+async def test_claude_playwright(background_tasks: BackgroundTasks):
+    """
+    Phase 2 validation: launches Playwright on Railway, opens claude.ai
+    with CLAUDE_COOKIES, submits a test prompt, and returns Claude's response.
+    Also sends the result to Telegram so you can confirm from your phone.
+
+    Expected response time: 30–90 seconds.
+    Set your HTTP client timeout to 120s minimum before calling this.
+    """
+    import asyncio
+    from datetime import datetime
+    import pytz
+    import httpx
+
+    ist_now = datetime.now(pytz.timezone("Asia/Kolkata")).strftime("%Y-%m-%d %H:%M:%S IST")
+    start = asyncio.get_event_loop().time()
+
+    TEST_PROMPT = (
+        "I am testing a Playwright automation that connects to Claude.ai from a Railway server. "
+        "Please respond with exactly this sentence, nothing more: "
+        "'Libero Phase 2 validation successful. Claude.ai is reachable from Railway.'"
+    )
+
+    try:
+        from playwright.claude_generate import generate_linkedin_post
+        claude_response = await generate_linkedin_post(TEST_PROMPT)
+        duration = round(asyncio.get_event_loop().time() - start, 2)
+
+        logger.info(f"[/test/claude] SUCCESS in {duration}s: {claude_response[:80]}")
+
+        # Notify Telegram in background — don't block the HTTP response
+        background_tasks.add_task(
+            _notify_telegram_phase2,
+            success=True,
+            response=claude_response,
+            duration=duration,
+            timestamp=ist_now,
+        )
+
+        return {
+            "success": True,
+            "claude_response": claude_response,
+            "duration_seconds": duration,
+            "timestamp_ist": ist_now,
+        }
+
+    except Exception as e:
+        duration = round(asyncio.get_event_loop().time() - start, 2)
+        error_msg = str(e)
+        logger.error(f"[/test/claude] FAILED in {duration}s: {error_msg}")
+
+        background_tasks.add_task(
+            _notify_telegram_phase2,
+            success=False,
+            response=None,
+            duration=duration,
+            timestamp=ist_now,
+            error=error_msg,
+        )
+
+        return {
+            "success": False,
+            "error": error_msg,
+            "duration_seconds": duration,
+            "timestamp_ist": ist_now,
+        }
+
+
+async def _notify_telegram_phase2(
+    success: bool,
+    response: str | None,
+    duration: float,
+    timestamp: str,
+    error: str | None = None,
+):
+    """Send Phase 2 test result to Telegram."""
+    import httpx
+
+    bot_token = settings.TELEGRAM_BOT_TOKEN
+    chat_id = settings.TELEGRAM_CHAT_ID
+    if not bot_token or not chat_id:
+        return
+
+    if success:
+        text = (
+            f"✅ <b>Phase 2 PASSED</b>\n\n"
+            f"Claude.ai is reachable from Railway via Playwright.\n\n"
+            f"<b>Claude's response:</b>\n{response}\n\n"
+            f"⏱ {duration}s  |  🕐 {timestamp}"
+        )
+    else:
+        safe_error = (error or "unknown error").replace("<", "&lt;").replace(">", "&gt;")
+        text = (
+            f"❌ <b>Phase 2 FAILED</b>\n\n"
+            f"<b>Error:</b>\n<code>{safe_error}</code>\n\n"
+            f"⏱ {duration}s  |  🕐 {timestamp}\n\n"
+            f"<b>Common fixes:</b>\n"
+            f"• CLAUDE_COOKIES expired → re-export from browser\n"
+            f"• Playwright not installed → check Dockerfile build log\n"
+            f"• DOM changed → update selectors in claude_generate.py"
+        )
+
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            await client.post(
+                f"https://api.telegram.org/bot{bot_token}/sendMessage",
+                json={"chat_id": chat_id, "text": text, "parse_mode": "HTML"},
+            )
+    except Exception as e:
+        logger.warning(f"[/test/claude] Telegram notify failed: {e}")
