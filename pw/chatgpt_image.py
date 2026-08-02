@@ -28,9 +28,9 @@ from .session_loader import get_browser_context
 logger = logging.getLogger(__name__)
 
 # Timeouts (milliseconds)
-NAV_TIMEOUT = 60_000
-IMAGE_WAIT_TIMEOUT = 90_000   # ChatGPT image generation can take up to 90s
-DOWNLOAD_TIMEOUT = 30         # seconds for httpx download
+NAV_TIMEOUT = 120_000
+IMAGE_WAIT_TIMEOUT = 120_000   # ChatGPT image generation can take up to 90s
+DOWNLOAD_TIMEOUT = 30          # seconds for httpx download
 
 
 def build_image_prompt(topic: str, post_hook: str = "") -> str:
@@ -82,7 +82,12 @@ async def generate_image_chatgpt(prompt: str, save_path: str | None = None) -> s
                 timeout=NAV_TIMEOUT,
             )
         except PlaywrightTimeoutError:
-            raise RuntimeError("chatgpt.com did not load within 60s. Session may be expired.")
+            raise RuntimeError(
+                "chatgpt.com did not load within 120s on Railway. "
+                "This usually means CHATGPT_COOKIES are not set or expired — "
+                "the browser is hitting a login redirect. "
+                "Export cookies from chatgpt.com using Cookie-Editor and add to Railway Variables."
+            )
 
         # Check we're logged in
         current_url = page.url
