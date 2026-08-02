@@ -363,25 +363,38 @@ async def handle_photo_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
         public_url = None
 
         try:
-            supabase = get_supabase()
+            import httpx as _httpx
+            from config import settings as _settings
+
             with open(save_path, "rb") as f:
                 image_bytes = f.read()
 
-            # Upload to 'post-images' bucket
-            supabase.storage.from_("post-images").upload(
-                path=storage_path,
-                file=image_bytes,
-                file_options={"content-type": "image/jpeg", "upsert": "true"},
+            # Upload directly via Supabase Storage REST API using httpx
+            # Avoids supabase-py client timeout issues
+            upload_url = (
+                f"{_settings.SUPABASE_URL}/storage/v1/object/post-images/{storage_path}"
             )
+            async with _httpx.AsyncClient(timeout=30) as _client:
+                upload_resp = await _client.post(
+                    upload_url,
+                    content=image_bytes,
+                    headers={
+                        "Authorization": f"Bearer {_settings.SUPABASE_SERVICE_KEY}",
+                        "Content-Type": "image/jpeg",
+                        "x-upsert": "true",
+                    },
+                )
 
-            # Get public URL
-            url_response = supabase.storage.from_("post-images").get_public_url(storage_path)
-            public_url = url_response
-            logger.info(f"[handle_photo] Uploaded to Supabase Storage: {public_url}")
+            if upload_resp.status_code in (200, 201):
+                public_url = (
+                    f"{_settings.SUPABASE_URL}/storage/v1/object/public/post-images/{storage_path}"
+                )
+                logger.info(f"[handle_photo] Uploaded to Supabase Storage: {public_url}")
+            else:
+                raise Exception(f"Storage upload returned {upload_resp.status_code}: {upload_resp.text[:200]}")
 
         except Exception as storage_err:
             logger.warning(f"[handle_photo] Supabase Storage upload failed: {storage_err}")
-            # Fall back to storing local path reference
             public_url = f"telegram://user_upload/{os.path.basename(save_path)}"
 
         # 3. Save URL to Supabase posts table
