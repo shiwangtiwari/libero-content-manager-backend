@@ -1,14 +1,11 @@
 """
-playwright/claude_generate.py
-------------------------------
+pw/claude_generate.py
+---------------------
 Opens claude.ai with session cookies, submits a prompt, waits for the
 response to finish streaming, and returns the assistant text.
 
 Phase 2: called by /test/claude to validate Railway → Claude.ai connectivity.
 Phase 3: called by the content generation job with the full LinkedIn post prompt.
-
-Selectors current as of claude.ai DOM, August 2025.
-If Claude changes their frontend, update the selectors in _extract_response().
 """
 
 import asyncio
@@ -21,19 +18,15 @@ from .session_loader import get_browser_context
 logger = logging.getLogger(__name__)
 
 # Timeouts (milliseconds)
-NAV_TIMEOUT          = 45_000   # page.goto
-INPUT_WAIT_TIMEOUT   = 15_000   # wait for the text box to appear
-RESPONSE_START_MS    = 20_000   # stop button must appear within this long
-RESPONSE_FINISH_MS   = 120_000  # stop button must disappear within this long
+NAV_TIMEOUT          = 45_000
+INPUT_WAIT_TIMEOUT   = 5_000   # per selector attempt
+RESPONSE_START_MS    = 20_000
+RESPONSE_FINISH_MS   = 120_000
 
 
 async def generate_linkedin_post(prompt: str) -> str:
     """
     Submit a prompt to claude.ai and return the assistant's response as plain text.
-
-    Raises:
-        EnvironmentError  — CLAUDE_COOKIES not set
-        RuntimeError      — navigation, interaction, or extraction failure
     """
     logger.info("[claude_generate] Starting — opening claude.ai")
 
@@ -54,7 +47,7 @@ async def generate_linkedin_post(prompt: str) -> str:
                 "Session may be expired — re-export CLAUDE_COOKIES."
             )
 
-        # ── 2. Confirm we landed on the chat UI, not a login/upgrade page ────
+        # ── 2. Confirm we landed on the chat UI ───────────────────────────────
         current_url = page.url
         if any(kw in current_url for kw in ["login", "upgrade", "onboard", "sign"]):
             raise RuntimeError(
@@ -62,59 +55,54 @@ async def generate_linkedin_post(prompt: str) -> str:
                 "Re-export CLAUDE_COOKIES from claude.ai and update Railway Variables."
             )
 
-        await asyncio.sleep(1.5)  # SPA needs a moment after navigation
+        await asyncio.sleep(1.5)
 
-        # ── 3. Find and fill the prompt input ────────────────────────────────
-        # Try multiple selectors in order — claude.ai DOM changes occasionally
-input_selectors = [
-    'div[contenteditable="true"]',
-    'div[contenteditable="true"][data-placeholder]',
-    '.ProseMirror',
-    '[data-testid="composer-input"]',
-    'div[role="textbox"]',
-]
+        # ── 3. Find input box — try multiple selectors ────────────────────────
+        input_selectors = [
+            'div[contenteditable="true"]',
+            'div[contenteditable="true"][data-placeholder]',
+            '.ProseMirror',
+            '[data-testid="composer-input"]',
+            'div[role="textbox"]',
+        ]
 
-input_box = None
-for selector in input_selectors:
-    try:
-        await page.wait_for_selector(selector, timeout=5_000)
-        input_box = page.locator(selector).first
-        logger.info(f"[claude_generate] Found input box with selector: {selector}")
-        break
-    except PlaywrightTimeoutError:
-        continue
+        input_box = None
+        for selector in input_selectors:
+            try:
+                await page.wait_for_selector(selector, timeout=INPUT_WAIT_TIMEOUT)
+                input_box = page.locator(selector).first
+                logger.info(f"[claude_generate] Found input with selector: {selector}")
+                break
+            except PlaywrightTimeoutError:
+                continue
 
-if input_box is None:
-    await page.screenshot(path="/tmp/claude_no_input.png")
-    raise RuntimeError(
-        "Could not find Claude.ai input box. "
-        "The DOM may have changed. "
-        "Screenshot saved to /tmp/claude_no_input.png — check Railway logs."
-    )
+        if input_box is None:
+            await page.screenshot(path="/tmp/claude_no_input.png")
+            raise RuntimeError(
+                "Could not find Claude.ai input box. "
+                "The DOM may have changed. "
+                "Screenshot saved to /tmp/claude_no_input.png — check Railway logs."
+            )
 
-await input_box.click()
-await asyncio.sleep(0.3)
-await input_box.fill(prompt)
-await asyncio.sleep(0.8)
+        # ── 4. Fill and submit ────────────────────────────────────────────────
+        await input_box.click()
+        await asyncio.sleep(0.3)
+        await input_box.fill(prompt)
+        await asyncio.sleep(0.8)
 
-        # ── 4. Submit ─────────────────────────────────────────────────────────
         logger.info("[claude_generate] Submitting prompt")
         await page.keyboard.press("Enter")
 
-        # ── 5. Wait for response to start (stop button appears) ───────────────
+        # ── 5. Wait for response to start ─────────────────────────────────────
         try:
             await page.wait_for_selector(
                 'button[aria-label="Stop"]',
                 timeout=RESPONSE_START_MS,
             )
         except PlaywrightTimeoutError:
-            # May already be done (very short response) — fall through to extraction
-            logger.warning(
-                "[claude_generate] Stop button never appeared — "
-                "response may have been instantaneous"
-            )
+            logger.warning("[claude_generate] Stop button never appeared — may be instant response")
 
-        # ── 6. Wait for response to finish (stop button disappears) ───────────
+        # ── 6. Wait for response to finish ────────────────────────────────────
         try:
             await page.wait_for_selector(
                 'button[aria-label="Stop"]',
@@ -123,14 +111,12 @@ await asyncio.sleep(0.8)
             )
         except PlaywrightTimeoutError:
             raise RuntimeError(
-                "Claude response did not finish streaming within 120s. "
-                "Prompt may be too long, or Railway is slow. "
-                "Try again or increase RESPONSE_FINISH_MS."
+                "Claude response did not finish streaming within 120s."
             )
 
-        await asyncio.sleep(1.0)  # brief tail before scraping
+        await asyncio.sleep(1.0)
 
-        # ── 7. Extract response text ──────────────────────────────────────────
+        # ── 7. Extract response ───────────────────────────────────────────────
         response_text = await _extract_response(page)
         logger.info(f"[claude_generate] Done — {len(response_text)} chars extracted")
         return response_text
@@ -142,47 +128,35 @@ await asyncio.sleep(0.8)
 
 
 async def _extract_response(page) -> str:
-    """
-    Extract the last assistant message from the page.
-    Tries three selectors in order — most specific first.
-    """
-    # Primary: class used on assistant message bubbles
+    """Extract the last assistant message. Tries three selectors in order."""
     messages = await page.locator(".font-claude-message").all()
     if messages:
         text = await messages[-1].inner_text()
         if text and text.strip():
             return text.strip()
 
-    # Fallback 1: data-testid attribute
     messages = await page.locator('[data-testid="assistant-message"]').all()
     if messages:
         text = await messages[-1].inner_text()
         if text and text.strip():
             return text.strip()
 
-    # Fallback 2: role attribute
     messages = await page.locator('[data-message-author-role="assistant"]').all()
     if messages:
         text = await messages[-1].inner_text()
         if text and text.strip():
             return text.strip()
 
-    # Nothing worked — log page body for debugging
     body_snippet = (await page.inner_text("body"))[:500]
     logger.error(f"[claude_generate] No response found. Page body: {body_snippet}")
     raise RuntimeError(
         "No assistant response found on the page. "
-        "Claude.ai DOM may have changed — check Railway logs for page body snippet "
-        "and update selectors in _extract_response()."
+        "Claude.ai DOM may have changed — check Railway logs."
     )
 
 
 async def validate_session() -> dict:
-    """
-    Quick health check: can we open claude.ai with current cookies?
-    Returns {"is_healthy": bool, "url_after_load": str, "error": str|None}
-    Called by GET /health/sessions.
-    """
+    """Quick health check: can we open claude.ai with current cookies?"""
     result = {"is_healthy": False, "url_after_load": None, "error": None}
     try:
         pw, browser, context = await get_browser_context("claude")
