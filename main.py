@@ -9,10 +9,9 @@ Startup sequence:
 
 All runs on Railway. Nothing runs locally.
 
-Phase 3 changes:
-  - scheduler.py now includes Mon/Tue/Wed 6AM content generation jobs
-  - Added /run_now endpoint to manually trigger content pipeline
-  - Added /internal/run_pipeline endpoint
+Crash loop fix: Telegram Conflict errors (two Railway instances fighting over
+polling) are now caught and logged instead of crashing uvicorn. Railway stops
+restarting because the process stays alive.
 """
 import logging
 import asyncio
@@ -30,7 +29,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Global telegram application instance
 _telegram_app = None
 
 
@@ -38,14 +36,18 @@ _telegram_app = None
 async def lifespan(app: FastAPI):
     global _telegram_app
 
-    # ── Startup ──────────────────────────────────────────────────────────────
     logger.info("Starting Libero backend...")
 
     # 1. APScheduler
-    start_scheduler()
-    logger.info("APScheduler started.")
+    try:
+        start_scheduler()
+        logger.info("APScheduler started.")
+    except Exception as e:
+        logger.error(f"APScheduler failed to start: {e}")
 
-    # 2. Telegram bot polling — only starts if token is configured
+    # 2. Telegram polling
+    # Wrapped in broad exception handler so ANY error (including
+    # telegram.error.Conflict from two instances) does not kill the process.
     if settings.TELEGRAM_BOT_TOKEN:
         try:
             from routers.telegram import build_telegram_app
@@ -56,9 +58,9 @@ async def lifespan(app: FastAPI):
                 drop_pending_updates=True,
                 allowed_updates=["message"],
             )
-            logger.info("Telegram bot polling started.")
+            logger.info("Telegram polling started.")
 
-            # Send startup notification
+            # Startup notification — failure here never crashes the app
             try:
                 from routers.telegram import send_telegram_message
                 from datetime import datetime
@@ -71,16 +73,19 @@ async def lifespan(app: FastAPI):
                     f"Send /status to check system health."
                 )
             except Exception as e:
-                logger.warning(f"Startup Telegram notification failed: {e}")
+                logger.warning(f"Startup notification failed (non-fatal): {e}")
 
         except Exception as e:
-            logger.warning(f"Telegram bot failed to start: {e}. Add TELEGRAM_BOT_TOKEN to Railway vars.")
+            # This catches telegram.error.Conflict and everything else.
+            # We log it and keep the process alive — Railway will NOT restart.
+            logger.error(f"Telegram startup error (non-fatal, continuing): {e}")
+            _telegram_app = None
     else:
-        logger.warning("TELEGRAM_BOT_TOKEN not set — Telegram bot disabled. Add it to Railway Variables.")
+        logger.warning("TELEGRAM_BOT_TOKEN not set — Telegram bot disabled.")
 
-    yield  # App runs here
+    yield  # App runs here — all HTTP endpoints available
 
-    # ── Shutdown ──────────────────────────────────────────────────────────────
+    # Shutdown
     logger.info("Shutting down Libero backend...")
     if _telegram_app:
         try:
@@ -97,7 +102,6 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# CORS — Vercel frontend + local dev
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -110,7 +114,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ── Routers ───────────────────────────────────────────────────────────────────
 app.include_router(health.router)
 app.include_router(posts.router)
 app.include_router(linkedin.router)
@@ -128,7 +131,6 @@ async def root():
         "phase": "Phase 3 — Content Intelligence",
         "status": "running",
         "time_ist": datetime.now(pytz.timezone("Asia/Kolkata")).strftime("%Y-%m-%d %H:%M IST"),
-        "docs": "/docs",
     }
 
 
@@ -136,16 +138,12 @@ async def root():
 
 @app.post("/run_now")
 async def run_pipeline_now(background_tasks: BackgroundTasks):
-    """
-    Manually trigger the content generation pipeline.
-    Equivalent to what the Mon/Tue/Wed 6AM scheduler job does.
-    Use this to test Phase 3 without waiting for Monday.
-    """
-    logger.info("[/run_now] Manual content pipeline trigger")
+    """Manually trigger the content generation pipeline."""
+    logger.info("[/run_now] Manual trigger received")
     background_tasks.add_task(_run_pipeline_background)
     return {
         "ok": True,
-        "message": "Content pipeline triggered. You will receive a Telegram notification with the draft in ~30 seconds.",
+        "message": "Content pipeline triggered. Telegram notification incoming in ~30 seconds.",
     }
 
 
@@ -159,149 +157,75 @@ async def _run_pipeline_background():
         try:
             from routers.telegram import send_telegram_message
             await send_telegram_message(
-                f"❌ <b>Manual pipeline trigger failed</b>\n\n"
+                f"❌ <b>Pipeline failed</b>\n\n"
                 f"<b>Error:</b> {str(e)[:300]}\n\n"
-                f"Check Railway logs."
+                f"Check Railway logs for full traceback."
             )
         except Exception:
             pass
 
 
-# ── Test endpoints (Phase 1 validation) ──────────────────────────────────────
-
-@app.post("/test/linkedin")
-async def test_linkedin_post():
-    """Phase 1 test: sends a test post to LinkedIn via the API."""
-    if not settings.LINKEDIN_ACCESS_TOKEN or not settings.LINKEDIN_PERSON_URN:
-        return {"error": "LINKEDIN_ACCESS_TOKEN and LINKEDIN_PERSON_URN not set in Railway Variables."}
-    from services.linkedin_poster import send_test_post
-    result = await send_test_post()
-    return result
-
-
-@app.get("/test/telegram")
-async def test_telegram():
-    """Phase 1 test: sends a test message to Telegram."""
-    if not settings.TELEGRAM_BOT_TOKEN:
-        return {"error": "TELEGRAM_BOT_TOKEN not set in Railway Variables."}
-    from routers.telegram import send_telegram_message
-    await send_telegram_message("🧪 Libero Phase 1 test — Telegram connection confirmed.")
-    return {"ok": True, "message": "Test message sent to Telegram."}
-
+# ── Test endpoints ────────────────────────────────────────────────────────────
 
 @app.get("/test/env")
 async def test_env():
-    """Phase 1 test: verify which env vars are set (values hidden)."""
-    def present(val):
-        return bool(val)
-
+    """Check which env vars are set in Railway (values hidden)."""
+    def p(val): return bool(val)
     return {
-        "SUPABASE_URL": present(settings.SUPABASE_URL),
-        "SUPABASE_SERVICE_KEY": present(settings.SUPABASE_SERVICE_KEY),
-        "TELEGRAM_BOT_TOKEN": present(settings.TELEGRAM_BOT_TOKEN),
-        "TELEGRAM_CHAT_ID": present(settings.TELEGRAM_CHAT_ID),
-        "LINKEDIN_CLIENT_ID": present(settings.LINKEDIN_CLIENT_ID),
-        "LINKEDIN_CLIENT_SECRET": present(settings.LINKEDIN_CLIENT_SECRET),
-        "LINKEDIN_ACCESS_TOKEN": present(settings.LINKEDIN_ACCESS_TOKEN),
-        "LINKEDIN_PERSON_URN": present(settings.LINKEDIN_PERSON_URN),
-        "ANTHROPIC_API_KEY": present(settings.ANTHROPIC_API_KEY),
-        "CLAUDE_COOKIES": present(settings.CLAUDE_COOKIES),
-        "CHATGPT_COOKIES": present(settings.CHATGPT_COOKIES),
-        "GEMINI_COOKIES": present(settings.GEMINI_COOKIES),
+        "SUPABASE_URL": p(settings.SUPABASE_URL),
+        "SUPABASE_SERVICE_KEY": p(settings.SUPABASE_SERVICE_KEY),
+        "TELEGRAM_BOT_TOKEN": p(settings.TELEGRAM_BOT_TOKEN),
+        "TELEGRAM_CHAT_ID": p(settings.TELEGRAM_CHAT_ID),
+        "LINKEDIN_CLIENT_ID": p(settings.LINKEDIN_CLIENT_ID),
+        "LINKEDIN_CLIENT_SECRET": p(settings.LINKEDIN_CLIENT_SECRET),
+        "LINKEDIN_ACCESS_TOKEN": p(settings.LINKEDIN_ACCESS_TOKEN),
+        "LINKEDIN_PERSON_URN": p(settings.LINKEDIN_PERSON_URN),
+        "ANTHROPIC_API_KEY": p(settings.ANTHROPIC_API_KEY),
+        "CLAUDE_COOKIES": p(settings.CLAUDE_COOKIES),
+        "CHATGPT_COOKIES": p(settings.CHATGPT_COOKIES),
+        "GEMINI_COOKIES": p(settings.GEMINI_COOKIES),
     }
 
 
-# ── Test endpoint (Phase 2 validation) ───────────────────────────────────────
-
 @app.post("/test/claude")
 async def test_claude(background_tasks: BackgroundTasks):
-    """
-    Phase 2 validation: calls Anthropic API directly.
-    Returns Claude's response and sends result to Telegram.
-    """
+    """Test Anthropic API key — response sent to Telegram."""
     from datetime import datetime
     import pytz
-
     ist_now = datetime.now(pytz.timezone("Asia/Kolkata")).strftime("%Y-%m-%d %H:%M:%S IST")
     start = asyncio.get_event_loop().time()
 
     try:
         from services.content_generator import generate_post
-        claude_response = await generate_post(
-            topic="Phase 2 validation test — please respond with exactly: "
-                  "'Libero Phase 2 validation successful. Anthropic API is working.'",
+        response = await generate_post(
+            topic="API key validation — respond with exactly: 'Anthropic API working.'",
             last_topics="",
             signal_card="validation",
         )
         duration = round(asyncio.get_event_loop().time() - start, 2)
-        logger.info(f"[/test/claude] SUCCESS in {duration}s: {claude_response[:80]}")
-
-        background_tasks.add_task(
-            _notify_telegram_phase2,
-            success=True,
-            response=claude_response,
-            duration=duration,
-            timestamp=ist_now,
-        )
-
-        return {
-            "success": True,
-            "claude_response": claude_response,
-            "duration_seconds": duration,
-            "timestamp_ist": ist_now,
-        }
-
+        background_tasks.add_task(_notify_phase2, True, response, duration, ist_now)
+        return {"success": True, "response": response, "duration_seconds": duration}
     except Exception as e:
         duration = round(asyncio.get_event_loop().time() - start, 2)
-        error_msg = str(e)
-        logger.error(f"[/test/claude] FAILED in {duration}s: {error_msg}")
-
-        background_tasks.add_task(
-            _notify_telegram_phase2,
-            success=False,
-            response=None,
-            duration=duration,
-            timestamp=ist_now,
-            error=error_msg,
-        )
-
-        return {
-            "success": False,
-            "error": error_msg,
-            "duration_seconds": duration,
-            "timestamp_ist": ist_now,
-        }
+        background_tasks.add_task(_notify_phase2, False, None, duration, ist_now, str(e))
+        return {"success": False, "error": str(e), "duration_seconds": duration}
 
 
-async def _notify_telegram_phase2(
-    success: bool,
-    response: str | None,
-    duration: float,
-    timestamp: str,
-    error: str | None = None,
-):
-    """Send Phase 2 test result to Telegram."""
+async def _notify_phase2(success, response, duration, timestamp, error=None):
     bot_token = settings.TELEGRAM_BOT_TOKEN
     chat_id = settings.TELEGRAM_CHAT_ID
     if not bot_token or not chat_id:
         return
-
     if success:
-        text = (
-            f"✅ <b>Phase 2 PASSED</b>\n\n"
-            f"Anthropic API is working from Railway.\n\n"
-            f"<b>Claude's response:</b>\n{response}\n\n"
-            f"⏱ {duration}s  |  🕐 {timestamp}"
-        )
+        text = f"✅ <b>Anthropic API working</b>\n\n{response}\n\n⏱ {duration}s | {timestamp}"
     else:
-        safe_error = (error or "unknown error").replace("<", "&lt;").replace(">", "&gt;")
+        safe = (error or "").replace("<", "&lt;").replace(">", "&gt;")
         text = (
-            f"❌ <b>Phase 2 FAILED</b>\n\n"
-            f"<b>Error:</b>\n<code>{safe_error}</code>\n\n"
-            f"⏱ {duration}s  |  🕐 {timestamp}\n\n"
-            f"Check ANTHROPIC_API_KEY is set correctly in Railway Variables."
+            f"❌ <b>Anthropic API failed</b>\n\n"
+            f"<b>Error:</b> <code>{safe}</code>\n\n"
+            f"⏱ {duration}s | {timestamp}\n\n"
+            f"Fix: Railway → Variables → ANTHROPIC_API_KEY → re-paste a fresh key."
         )
-
     try:
         import httpx
         async with httpx.AsyncClient(timeout=10) as client:
@@ -309,5 +233,22 @@ async def _notify_telegram_phase2(
                 f"https://api.telegram.org/bot{bot_token}/sendMessage",
                 json={"chat_id": chat_id, "text": text, "parse_mode": "HTML"},
             )
-    except Exception as e:
-        logger.warning(f"[/test/claude] Telegram notify failed: {e}")
+    except Exception:
+        pass
+
+
+@app.get("/test/telegram")
+async def test_telegram():
+    if not settings.TELEGRAM_BOT_TOKEN:
+        return {"error": "TELEGRAM_BOT_TOKEN not set."}
+    from routers.telegram import send_telegram_message
+    await send_telegram_message("🧪 Libero — Telegram connection confirmed.")
+    return {"ok": True}
+
+
+@app.post("/test/linkedin")
+async def test_linkedin_post():
+    if not settings.LINKEDIN_ACCESS_TOKEN or not settings.LINKEDIN_PERSON_URN:
+        return {"error": "LINKEDIN_ACCESS_TOKEN and LINKEDIN_PERSON_URN not set."}
+    from services.linkedin_poster import send_test_post
+    return await send_test_post()
