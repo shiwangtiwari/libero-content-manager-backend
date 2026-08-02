@@ -218,6 +218,26 @@ async def handle_mind_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     )
 
 
+
+# ── Command: /run_now ─────────────────────────────────────────────────────────
+
+async def handle_run_now(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Manually trigger the content generation pipeline."""
+    if str(update.effective_chat.id) != settings.TELEGRAM_CHAT_ID:
+        return
+    await update.message.reply_text(
+        "⚙️ Triggering content generation pipeline...\n"
+        "You will receive a draft notification in ~30 seconds.\n\n"
+        "Or call POST /run_now on the Railway URL."
+    )
+    try:
+        from services.content_pipeline import run_content_pipeline
+        import asyncio
+        asyncio.create_task(run_content_pipeline())
+    except Exception as e:
+        await update.message.reply_text(f"❌ Pipeline trigger failed: {e}")
+
+
 # ── Application factory ───────────────────────────────────────────────────────
 
 def build_telegram_app() -> Application:
@@ -228,5 +248,6 @@ def build_telegram_app() -> Application:
     app.add_handler(CommandHandler("status", handle_status))
     app.add_handler(CommandHandler("queue", handle_queue))
     app.add_handler(CommandHandler("generate_image", handle_generate_image))
+    app.add_handler(CommandHandler("run_now", handle_run_now))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_mind_input))
     return app
