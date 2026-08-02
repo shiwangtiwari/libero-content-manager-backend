@@ -174,123 +174,214 @@ async def handle_reschedule(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
 # ── Command: /generate_image ─────────────────────────────────────────────────
 
+# Stores the post_id waiting for an image, so when you send a photo
+# the bot knows which post to attach it to.
+_pending_image_post_id: str | None = None
+
+
+def _build_image_prompt(post: dict) -> str:
+    """
+    Build a ready-to-copy image generation prompt from the post content.
+    Tailored for ChatGPT / Gemini / Grok image generation.
+    """
+    content = post.get("content", "")
+    signal_card = post.get("signal_card") or {}
+
+    # Extract topic
+    topic = (
+        signal_card.get("selected_topic")
+        or signal_card.get("trigger", "")
+        or "Product Management"
+    )[:80]
+
+    # Extract hook (first non-empty line)
+    hook = next((l.strip() for l in content.split("\n") if l.strip()), content[:80])
+
+    # Extract hashtags
+    tags = [l.strip() for l in content.split("\n") if l.strip().startswith("#")]
+    tag_str = " ".join(tags[:3]) if tags else "#ProductManagement #DevToPM"
+
+    prompt = f"""Create a professional LinkedIn post image with these exact specs:
+
+TOPIC: {topic}
+KEY MESSAGE: {hook[:100]}
+
+STYLE REQUIREMENTS:
+- Realistic or semi-realistic illustration style (NOT a text card, NOT a quote graphic)
+- A visual scene that represents the theme metaphorically
+- Examples of good visuals for this topic:
+  * A person at a desk with their LinkedIn profile glowing on screen while the office is empty around them
+  * A split scene: busy creative work on one side, empty social media on the other
+  * Abstract visual of a city skyline with one window lit up (representing the ghost town theme)
+- Warm, professional color palette — navy, amber, or teal tones
+- Cinematic lighting, depth of field
+- NO text overlaid on the image whatsoever
+- NO stock photo feel — make it feel illustrated or editorial
+- Format: 1200x627 pixels (LinkedIn landscape ratio 1.91:1)
+- Mood: thought-provoking, slightly dramatic, professional
+
+WHAT TO AVOID:
+- No generic handshakes or business people in suits
+- No text, words, or typography on the image
+- No corporate clipart
+- No obvious AI-generated uncanny valley faces
+
+This image will accompany a LinkedIn post about: {topic}"""
+
+    return prompt
+
+
 async def handle_generate_image(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    Usage: /generate_image gemini  (or /generate_image chatgpt — auto-redirects to Gemini)
-    ChatGPT returns 403 from Railway datacenter IPs, so Gemini is the only option.
-    """
-    arg = context.args[0].lower() if context.args else "gemini"
-    if arg == "chatgpt":
-        await update.message.reply_text(
-            "⚠️ ChatGPT is blocked on Railway (403).\nUsing Gemini instead."
-        )
+    Usage:
+      /generate_image           → if 1 draft, gives prompt immediately
+                                  if multiple drafts, lists them to choose from
+      /generate_image <id>      → gives prompt for that specific post ID (first 8 chars)
 
-    candidates = queries.get_posts_by_status(["approved", "draft", "scheduled"])
-    if not candidates:
-        await update.message.reply_text("No posts in queue to generate an image for.")
+    After generating the image externally (ChatGPT/Gemini/Grok),
+    send it back here as a photo — bot attaches it to the selected post.
+    """
+    global _pending_image_post_id
+
+    posts = queries.get_posts_by_status(["approved", "draft", "scheduled"])
+    if not posts:
+        await update.message.reply_text(
+            "No posts in queue.\nRun /run_now to generate a draft first."
+        )
         return
 
-    post = next((p for p in candidates if not p.get("image_url")), candidates[0])
-    post_id = post["id"]
-    content = post["content"]
-    hook = next((l.strip() for l in content.split("\n") if l.strip()), content[:60])
-
-    await update.message.reply_text(
-        f"🎨 Generating LinkedIn card...\n"
-        f"Post: {content[:60]}…\n\n"
-        f"Ready in ~3 seconds."
-    )
-
-    asyncio.create_task(
-        _run_image_generation(
-            update=update,
-            post_id=post_id,
-            topic=_extract_topic_from_signal_card(post),
-            hook=hook,
+    # If a specific post ID prefix was passed, find it
+    arg = context.args[0].lower().strip() if context.args else None
+    if arg:
+        matched = next(
+            (p for p in posts if p["id"].lower().startswith(arg)),
+            None
         )
-    )
+        if not matched:
+            # Show available IDs
+            lines = ["\n".join(
+                f"• <code>{p['id'][:8]}</code> — {next((l.strip() for l in p['content'].split(chr(10)) if l.strip()), '')[:50]}…"
+                for p in posts
+            )]
+            await update.message.reply_text(
+                f"❌ No post found with ID starting with '<code>{arg}</code>'\n\n"
+                f"Available posts:\n{''.join(lines)}\n\n"
+                f"Usage: /generate_image &lt;first 8 chars of post ID&gt;",
+                parse_mode="HTML",
+            )
+            return
+        post = matched
 
+    # No arg — if only 1 post, auto-select. If multiple, show picker.
+    elif len(posts) == 1:
+        post = posts[0]
 
-async def _extract_topic_from_signal_card(post: dict) -> str:
-    sc = post.get("signal_card") or {}
-    if isinstance(sc, dict):
-        topic = sc.get("selected_topic") or sc.get("trigger", "")
-        if topic:
-            return topic[:100]
-    return (post.get("content") or "")[:80]
+    else:
+        # Multiple posts — show list so user can pick
+        lines = []
+        for p in posts:
+            hook = next((l.strip() for l in p["content"].split("\n") if l.strip()), "")[:60]
+            has_image = "🖼" if p.get("image_url") else "📝"
+            status = p.get("status", "draft")
+            scheduled = p.get("scheduled_time", "")[:10] if p.get("scheduled_time") else "unscheduled"
+            lines.append(
+                f"{has_image} <code>{p['id'][:8]}</code> — {hook}…\n"
+                f"   Status: {status} · Slot: {scheduled}"
+            )
 
-
-async def _run_image_generation(
-    update,
-    post_id: str,
-    topic: str,
-    hook: str,
-) -> None:
-    """
-    Generate LinkedIn card image using Pillow (no browser needed).
-    Playwright is blocked on Railway for all external sites.
-    Pillow generates the card instantly, server-side.
-    """
-    import os
-    from services.image_generator import generate_linkedin_card
-
-    image_path = None
-    actual_platform = "pillow"
-
-    try:
-        # Extract hashtags from the post content
-        from db import queries as q
-        posts = q.get_posts_by_status(["approved", "draft", "scheduled"])
-        post = next((p for p in posts if p["id"] == post_id), posts[0] if posts else {})
-        content = post.get("content", "")
-        hashtag_lines = [l.strip() for l in content.split("\n") if l.strip().startswith("#")]
-        hashtags = " ".join(hashtag_lines)[:80] if hashtag_lines else "#ProductManagement #DevToPM #NextLeap"
-
-        image_path = generate_linkedin_card(
-            hook=hook,
-            topic=topic,
-            hashtags=hashtags,
-        )
-
-        # Send image to Telegram
-        await send_telegram_file(
-            file_path=image_path,
-            caption=(
-                f"✅ LinkedIn card generated\n"
-                f"Post ID: {post_id[:8]}\n\n"
-                f"Happy with it? Send /approve to schedule the post.\n"
-                f"Want a new card? Send /generate_image again."
-            ),
-        )
-
-        # Save image URL reference to Supabase
-        # Store local path as placeholder — Phase 5 dashboard will show it via Telegram
-        queries.update_post_image(
-            post_id=post_id,
-            image_url=f"pillow://{os.path.basename(image_path)}",
-            image_generator="pillow",
-        )
-
-        logger.info(f"[generate_image] Done: {image_path} via {actual_platform}")
-
-    except Exception as e:
-        logger.error(f"[generate_image] Failed: {e}", exc_info=True)
         await update.message.reply_text(
-            f"❌ Image generation failed.\n\n"
-            f"<b>Error:</b> {str(e)[:200]}\n\n"
-            f"Possible fixes:\n"
-            f"• Check CHATGPT_COOKIES / GEMINI_COOKIES in Railway Variables\n"
-            f"• Re-export cookies from the platform and update Railway\n"
-            f"• Try the other platform: /generate_image {'gemini' if platform == 'chatgpt' else 'chatgpt'}",
+            f"📋 <b>You have {len(posts)} posts in queue.</b>\n\n"
+            f"Reply with the post ID you want to generate an image for:\n\n"
+            + "\n\n".join(lines)
+            + "\n\n<b>Example:</b> /generate_image f6645445",
             parse_mode="HTML",
         )
-    finally:
-        # Clean up temp file
-        if image_path and os.path.exists(image_path):
-            try:
-                os.remove(image_path)
-            except Exception:
-                pass
+        return
+
+    # We have a specific post — generate and send the prompt
+    _pending_image_post_id = post["id"]
+    prompt = _build_image_prompt(post)
+    hook = next((l.strip() for l in post["content"].split("\n") if l.strip()), "")
+    has_image_already = bool(post.get("image_url"))
+
+    await update.message.reply_text(
+        f"🎨 <b>Image prompt for Post <code>{post['id'][:8]}</code></b>\n"
+        + (f"⚠️ This post already has an image — sending a new one will replace it.\n" if has_image_already else "")
+        + f"\n<b>Hook:</b> {hook[:80]}\n\n"
+        f"<b>Steps:</b>\n"
+        f"1️⃣ Copy the prompt below\n"
+        f"2️⃣ Paste into ChatGPT / Gemini / Grok → generate\n"
+        f"3️⃣ Download the image → send it here as a photo\n"
+        f"4️⃣ Bot attaches it automatically\n\n"
+        f"<b>━━━ COPY THIS PROMPT ━━━</b>\n\n"
+        f"<code>{prompt}</code>\n\n"
+        f"<i>Waiting for your image... (send it as a photo in this chat)</i>",
+        parse_mode="HTML",
+    )
+
+
+# ── Photo handler — receives the image you send back after generating ─────────
+
+async def handle_photo_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    When you send a photo to the bot after /generate_image,
+    this handler attaches it to the pending post and saves to Supabase.
+    """
+    global _pending_image_post_id
+
+    if str(update.effective_chat.id) != settings.TELEGRAM_CHAT_ID:
+        return
+
+    if not _pending_image_post_id:
+        await update.message.reply_text(
+            "No pending post waiting for an image.\n"
+            "Send /generate_image first to get the prompt, then send the image here."
+        )
+        return
+
+    post_id = _pending_image_post_id
+
+    try:
+        # Get the highest resolution photo Telegram received
+        photo = update.message.photo[-1]
+        file = await context.bot.get_file(photo.file_id)
+
+        # Download to temp file
+        import os, time
+        save_path = f"/tmp/libero_user_image_{int(time.time())}.jpg"
+        await file.download_to_drive(save_path)
+
+        file_size = os.path.getsize(save_path)
+        logger.info(f"[handle_photo] Received image: {save_path} ({file_size} bytes) for post {post_id[:8]}")
+
+        # Save reference in Supabase
+        queries.update_post_image(
+            post_id=post_id,
+            image_url=f"telegram://user_upload/{os.path.basename(save_path)}",
+            image_generator="user_upload",
+        )
+
+        _pending_image_post_id = None
+
+        post = queries.get_post_by_id(post_id)
+        status = post.get("status", "draft") if post else "draft"
+
+        await update.message.reply_text(
+            f"✅ <b>Image attached to post {post_id[:8]}</b>\n\n"
+            f"Post status: <b>{status}</b>\n\n"
+            + (
+                f"The post is approved and will go live at the scheduled time with this image."
+                if status == "approved" else
+                f"Send /approve to approve the post — it will publish with this image."
+            ),
+            parse_mode="HTML",
+        )
+
+    except Exception as e:
+        logger.error(f"[handle_photo] Failed: {e}", exc_info=True)
+        await update.message.reply_text(
+            f"❌ Failed to save image: {e}\n\nTry sending the image again."
+        )
 
 
 # ── Plain text handler — "what's on my mind" input ───────────────────────────
@@ -311,8 +402,6 @@ async def handle_mind_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
 
 # ── Application factory ───────────────────────────────────────────────────────
-
-# ── Command: /run_now ─────────────────────────────────────────────────────────
 
 async def handle_run_now(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Manually trigger the content generation pipeline."""
@@ -338,5 +427,8 @@ def build_telegram_app() -> Application:
     app.add_handler(CommandHandler("queue", handle_queue))
     app.add_handler(CommandHandler("generate_image", handle_generate_image))
     app.add_handler(CommandHandler("run_now", handle_run_now))
+    # Photo handler — receives image after /generate_image prompt flow
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo_input))
+    # Text handler must be LAST
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_mind_input))
     return app
