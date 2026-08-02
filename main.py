@@ -12,7 +12,7 @@ All runs on Railway. Nothing runs locally.
 import logging
 import asyncio
 from contextlib import asynccontextmanager
-from fastapi import FastAPI
+from fastapi import FastAPI, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 
 from config import settings
