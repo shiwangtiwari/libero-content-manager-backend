@@ -65,22 +65,37 @@ async def generate_linkedin_post(prompt: str) -> str:
         await asyncio.sleep(1.5)  # SPA needs a moment after navigation
 
         # ── 3. Find and fill the prompt input ────────────────────────────────
-        input_selector = 'div[contenteditable="true"]'
-        try:
-            await page.wait_for_selector(input_selector, timeout=INPUT_WAIT_TIMEOUT)
-        except PlaywrightTimeoutError:
-            await page.screenshot(path="/tmp/claude_no_input.png")
-            raise RuntimeError(
-                "Could not find Claude.ai input box. "
-                "The DOM may have changed. "
-                "Screenshot saved to /tmp/claude_no_input.png — check Railway logs."
-            )
+        # Try multiple selectors in order — claude.ai DOM changes occasionally
+input_selectors = [
+    'div[contenteditable="true"]',
+    'div[contenteditable="true"][data-placeholder]',
+    '.ProseMirror',
+    '[data-testid="composer-input"]',
+    'div[role="textbox"]',
+]
 
-        input_box = page.locator(input_selector).first
-        await input_box.click()
-        await asyncio.sleep(0.3)
-        await input_box.fill(prompt)
-        await asyncio.sleep(0.8)  # settle before submitting
+input_box = None
+for selector in input_selectors:
+    try:
+        await page.wait_for_selector(selector, timeout=5_000)
+        input_box = page.locator(selector).first
+        logger.info(f"[claude_generate] Found input box with selector: {selector}")
+        break
+    except PlaywrightTimeoutError:
+        continue
+
+if input_box is None:
+    await page.screenshot(path="/tmp/claude_no_input.png")
+    raise RuntimeError(
+        "Could not find Claude.ai input box. "
+        "The DOM may have changed. "
+        "Screenshot saved to /tmp/claude_no_input.png — check Railway logs."
+    )
+
+await input_box.click()
+await asyncio.sleep(0.3)
+await input_box.fill(prompt)
+await asyncio.sleep(0.8)
 
         # ── 4. Submit ─────────────────────────────────────────────────────────
         logger.info("[claude_generate] Submitting prompt")
