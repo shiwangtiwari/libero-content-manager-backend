@@ -177,28 +177,133 @@ async def handle_reschedule(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 async def handle_generate_image(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     Usage: /generate_image chatgpt  or  /generate_image gemini
-    Fires the Playwright image generation job on Railway.
-    Image returned to Telegram when done.
-    Phase 4 feature — returns placeholder message during Phase 1.
+    Runs Playwright image generation on Railway, returns image in Telegram.
+    ChatGPT is P1, Gemini is P2 fallback.
     """
     platform = context.args[0].lower() if context.args else "chatgpt"
     if platform not in ("chatgpt", "gemini"):
-        await update.message.reply_text("Usage: /generate_image chatgpt  or  /generate_image gemini")
+        await update.message.reply_text(
+            "Usage: /generate_image chatgpt\nor /generate_image gemini"
+        )
         return
 
-    # Get the latest approved/draft post
-    posts = queries.get_posts_by_status(["draft", "approved", "scheduled"])
-    if not posts:
+    # Find the most recent post needing an image (approved or draft, no image yet)
+    candidates = queries.get_posts_by_status(["approved", "draft", "scheduled"])
+    if not candidates:
         await update.message.reply_text("No posts in queue to generate an image for.")
         return
 
-    post = posts[0]
+    # Prefer posts without an image already
+    post = next((p for p in candidates if not p.get("image_url")), candidates[0])
+    post_id = post["id"]
+    content = post["content"]
+
+    # Extract hook (first non-empty line) for the image headline
+    hook = next((l.strip() for l in content.split("\n") if l.strip()), content[:60])
+
     await update.message.reply_text(
-        f"🎨 Generating image via {platform}...\n"
-        f"Post: {post['content'][:60]}…\n\n"
-        f"⚠️ Image generation (Phase 4) not yet deployed. "
-        f"Use the dashboard to upload an image manually."
+        f"🎨 Generating image via {platform.upper()}...\n"
+        f"Post: {content[:60]}…\n\n"
+        f"This takes up to 90 seconds. Stay tuned."
     )
+
+    # Run generation in background so Telegram doesn't time out
+    asyncio.create_task(
+        _run_image_generation(
+            update=update,
+            platform=platform,
+            post_id=post_id,
+            topic=_extract_topic_from_signal_card(post),
+            hook=hook,
+        )
+    )
+
+
+async def _extract_topic_from_signal_card(post: dict) -> str:
+    """Pull the topic from the signal card, fall back to first line of content."""
+    sc = post.get("signal_card") or {}
+    if isinstance(sc, dict):
+        topic = sc.get("selected_topic") or sc.get("trigger", "")
+        if topic:
+            return topic[:100]
+    return (post.get("content") or "")[:80]
+
+
+async def _run_image_generation(
+    update,
+    platform: str,
+    post_id: str,
+    topic: str,
+    hook: str,
+) -> None:
+    """
+    Run Playwright image generation and send result to Telegram.
+    Automatically falls back from ChatGPT to Gemini on failure.
+    """
+    import os
+    from pw.chatgpt_image import generate_image_chatgpt, build_image_prompt
+    from pw.gemini_image import generate_image_gemini
+
+    image_path = None
+    actual_platform = platform
+    prompt = build_image_prompt(topic=topic, post_hook=hook)
+
+    try:
+        if platform == "chatgpt":
+            try:
+                image_path = await generate_image_chatgpt(prompt)
+                actual_platform = "chatgpt"
+            except Exception as chatgpt_err:
+                logger.warning(f"[generate_image] ChatGPT failed: {chatgpt_err}. Trying Gemini...")
+                await update.message.reply_text(
+                    f"⚠️ ChatGPT failed: {str(chatgpt_err)[:100]}\n"
+                    f"Falling back to Gemini..."
+                )
+                image_path = await generate_image_gemini(prompt)
+                actual_platform = "gemini"
+        else:
+            image_path = await generate_image_gemini(prompt)
+            actual_platform = "gemini"
+
+        # Send image to Telegram
+        await send_telegram_file(
+            file_path=image_path,
+            caption=(
+                f"✅ Image generated via {actual_platform.upper()}\n"
+                f"Post ID: {post_id[:8]}\n\n"
+                f"Happy with it? Send /approve to schedule the post.\n"
+                f"Want a different image? Send /generate_image {actual_platform} again."
+            ),
+        )
+
+        # Save image URL reference to Supabase
+        # Store local path as placeholder — Phase 5 dashboard will show it via Telegram
+        queries.update_post_image(
+            post_id=post_id,
+            image_url=f"telegram://{actual_platform}/{os.path.basename(image_path)}",
+            image_generator=actual_platform,
+        )
+
+        logger.info(f"[generate_image] Done: {image_path} via {actual_platform}")
+
+    except Exception as e:
+        logger.error(f"[generate_image] Failed: {e}", exc_info=True)
+        await update.message.reply_text(
+            f"❌ Image generation failed.\n\n"
+            f"<b>Error:</b> {str(e)[:200]}\n\n"
+            f"Possible fixes:\n"
+            f"• Check CHATGPT_COOKIES / GEMINI_COOKIES in Railway Variables\n"
+            f"• Re-export cookies from the platform and update Railway\n"
+            f"• Try the other platform: /generate_image {'gemini' if platform == 'chatgpt' else 'chatgpt'}",
+            parse_mode="HTML",
+        )
+    finally:
+        # Clean up temp file
+        if image_path and os.path.exists(image_path):
+            try:
+                os.remove(image_path)
+            except Exception:
+                pass
 
 
 # ── Plain text handler — "what's on my mind" input ───────────────────────────
@@ -218,6 +323,7 @@ async def handle_mind_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     )
 
 
+# ── Application factory ───────────────────────────────────────────────────────
 
 # ── Command: /run_now ─────────────────────────────────────────────────────────
 
@@ -227,18 +333,14 @@ async def handle_run_now(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
     await update.message.reply_text(
         "⚙️ Triggering content generation pipeline...\n"
-        "You will receive a draft notification in ~30 seconds.\n\n"
-        "Or call POST /run_now on the Railway URL."
+        "You will receive a draft notification in ~30 seconds."
     )
     try:
         from services.content_pipeline import run_content_pipeline
-        import asyncio
         asyncio.create_task(run_content_pipeline())
     except Exception as e:
         await update.message.reply_text(f"❌ Pipeline trigger failed: {e}")
 
-
-# ── Application factory ───────────────────────────────────────────────────────
 
 def build_telegram_app() -> Application:
     app = Application.builder().token(settings.TELEGRAM_BOT_TOKEN).build()
