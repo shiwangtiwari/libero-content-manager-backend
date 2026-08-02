@@ -5,7 +5,7 @@ FastAPI backend entry point.
 Startup sequence:
   1. Mount all API routers
   2. Start APScheduler (posting jobs, missed approval checks)
-  3. Start Telegram bot polling loop
+  3. Start Telegram bot polling loop (only if TELEGRAM_BOT_TOKEN is set)
 
 All runs on Railway. Nothing runs locally.
 """
@@ -17,7 +17,6 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from config import settings
 from scheduler import start_scheduler
-from routers.telegram import build_telegram_app
 from routers import health, posts, linkedin, inputs
 
 logging.basicConfig(
@@ -41,35 +40,46 @@ async def lifespan(app: FastAPI):
     start_scheduler()
     logger.info("APScheduler started.")
 
-    # 2. Telegram bot polling
-    _telegram_app = build_telegram_app()
-    await _telegram_app.initialize()
-    await _telegram_app.start()
-    await _telegram_app.updater.start_polling(drop_pending_updates=True)
-    logger.info("Telegram bot polling started.")
+    # 2. Telegram bot polling — only starts if token is configured
+    if settings.TELEGRAM_BOT_TOKEN:
+        try:
+            from routers.telegram import build_telegram_app
+            _telegram_app = build_telegram_app()
+            await _telegram_app.initialize()
+            await _telegram_app.start()
+            await _telegram_app.updater.start_polling(drop_pending_updates=True)
+            logger.info("Telegram bot polling started.")
 
-    # Send startup message to Shiwang
-    try:
-        from routers.telegram import send_telegram_message
-        from datetime import datetime
-        import pytz
-        ist_now = datetime.now(pytz.timezone("Asia/Kolkata")).strftime("%Y-%m-%d %H:%M IST")
-        await send_telegram_message(
-            f"🟢 <b>Libero is online</b>\n"
-            f"Started at {ist_now}\n"
-            f"Send /status to check system health."
-        )
-    except Exception as e:
-        logger.warning(f"Startup Telegram notification failed: {e}")
+            # Send startup notification
+            try:
+                from routers.telegram import send_telegram_message
+                from datetime import datetime
+                import pytz
+                ist_now = datetime.now(pytz.timezone("Asia/Kolkata")).strftime("%Y-%m-%d %H:%M IST")
+                await send_telegram_message(
+                    f"🟢 <b>Libero is online</b>\n"
+                    f"Started at {ist_now}\n"
+                    f"Send /status to check system health."
+                )
+            except Exception as e:
+                logger.warning(f"Startup Telegram notification failed: {e}")
+
+        except Exception as e:
+            logger.warning(f"Telegram bot failed to start: {e}. Add TELEGRAM_BOT_TOKEN to Railway vars.")
+    else:
+        logger.warning("TELEGRAM_BOT_TOKEN not set — Telegram bot disabled. Add it to Railway Variables.")
 
     yield  # App runs here
 
     # ── Shutdown ──────────────────────────────────────────────────────────────
     logger.info("Shutting down Libero backend...")
     if _telegram_app:
-        await _telegram_app.updater.stop()
-        await _telegram_app.stop()
-        await _telegram_app.shutdown()
+        try:
+            await _telegram_app.updater.stop()
+            await _telegram_app.stop()
+            await _telegram_app.shutdown()
+        except Exception as e:
+            logger.warning(f"Telegram shutdown error: {e}")
 
 
 app = FastAPI(
@@ -113,9 +123,10 @@ async def root():
 async def test_linkedin_post():
     """
     Phase 1 test: sends a test post to LinkedIn via the API.
-    Run this once to confirm LINKEDIN_ACCESS_TOKEN and LINKEDIN_PERSON_URN are correct.
-    DELETE this endpoint after Phase 1 validation is complete.
+    Only works after LINKEDIN_ACCESS_TOKEN and LINKEDIN_PERSON_URN are set.
     """
+    if not settings.LINKEDIN_ACCESS_TOKEN or not settings.LINKEDIN_PERSON_URN:
+        return {"error": "LINKEDIN_ACCESS_TOKEN and LINKEDIN_PERSON_URN not set in Railway Variables."}
     from services.linkedin_poster import send_test_post
     result = await send_test_post()
     return result
@@ -124,6 +135,8 @@ async def test_linkedin_post():
 @app.get("/test/telegram")
 async def test_telegram():
     """Phase 1 test: sends a test message to Telegram."""
+    if not settings.TELEGRAM_BOT_TOKEN:
+        return {"error": "TELEGRAM_BOT_TOKEN not set in Railway Variables."}
     from routers.telegram import send_telegram_message
     await send_telegram_message("🧪 Libero Phase 1 test — Telegram connection confirmed.")
     return {"ok": True, "message": "Test message sent to Telegram."}
