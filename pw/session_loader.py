@@ -4,17 +4,9 @@ pw/session_loader.py
 Loads a Playwright browser context pre-loaded with session cookies
 for claude.ai, chatgpt.com, or gemini.google.com.
 
-Every Playwright script in this project calls get_browser_context().
-Never instantiate Playwright directly in the scripts.
-
-Usage:
-    pw, browser, context = await get_browser_context("claude")
-    try:
-        page = await context.new_page()
-        ...
-    finally:
-        await browser.close()
-        await pw.stop()
+Proxy support added to bypass Cloudflare bot detection on Railway datacenter IPs.
+Set PROXY_URL in Railway Variables to enable. Format: http://user:pass@host:port
+If PROXY_URL is not set, runs without proxy (useful for local testing).
 """
 
 import json
@@ -67,8 +59,7 @@ async def get_browser_context(
     except json.JSONDecodeError as e:
         raise ValueError(
             f"'{env_var}' contains invalid JSON. "
-            f"Re-export cookies and paste the full JSON array (starts with '[', ends with ']'). "
-            f"Parse error: {e}"
+            f"Re-export cookies and paste the full JSON array. Error: {e}"
         )
 
     if not isinstance(cookies, list):
@@ -76,19 +67,32 @@ async def get_browser_context(
             f"'{env_var}' must be a JSON array starting with '['. Got: {type(cookies).__name__}"
         )
 
-    # Sanitise sameSite values — Cookie-Editor sometimes exports non-standard
-    # values like "unspecified" or "" that Playwright rejects.
-    # Normalise anything invalid to "Lax" as a safe default.
+    # Sanitise sameSite values — Cookie-Editor exports non-standard values
+    # like "unspecified" that Playwright rejects.
     for cookie in cookies:
         if cookie.get("sameSite") not in VALID_SAME_SITE:
             cookie["sameSite"] = "Lax"
 
     logger.info(f"[session_loader] platform={platform} cookies={len(cookies)}")
 
+    # Proxy configuration — bypasses Cloudflare bot detection on Railway IPs
+    # PROXY_URL format: http://username:password@host:port
+    proxy_url = os.environ.get("PROXY_URL")
+    proxy_config = {"server": proxy_url} if proxy_url else None
+
+    if proxy_url:
+        logger.info(f"[session_loader] Proxy enabled: {proxy_url.split('@')[-1]}")
+    else:
+        logger.warning(
+            "[session_loader] No PROXY_URL set — running without proxy. "
+            "Cloudflare may block Railway datacenter IP."
+        )
+
     pw = await async_playwright().start()
 
     browser = await pw.chromium.launch(
         headless=True,
+        proxy=proxy_config,
         args=[
             "--no-sandbox",
             "--disable-setuid-sandbox",
@@ -107,7 +111,7 @@ async def get_browser_context(
         extra_http_headers={"Accept-Language": "en-US,en;q=0.9"},
     )
 
-    # Spoof navigator.webdriver = undefined before any page loads
+    # Spoof navigator.webdriver before any page loads
     await context.add_init_script(
         "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
     )
