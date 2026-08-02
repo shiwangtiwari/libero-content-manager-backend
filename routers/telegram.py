@@ -176,42 +176,34 @@ async def handle_reschedule(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
 async def handle_generate_image(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    Usage: /generate_image chatgpt  or  /generate_image gemini
-    Runs Playwright image generation on Railway, returns image in Telegram.
-    ChatGPT is P1, Gemini is P2 fallback.
+    Usage: /generate_image gemini  (or /generate_image chatgpt — auto-redirects to Gemini)
+    ChatGPT returns 403 from Railway datacenter IPs, so Gemini is the only option.
     """
-    platform = context.args[0].lower() if context.args else "chatgpt"
-    if platform not in ("chatgpt", "gemini"):
+    arg = context.args[0].lower() if context.args else "gemini"
+    if arg == "chatgpt":
         await update.message.reply_text(
-            "Usage: /generate_image chatgpt\nor /generate_image gemini"
+            "⚠️ ChatGPT is blocked on Railway (403).\nUsing Gemini instead."
         )
-        return
 
-    # Find the most recent post needing an image (approved or draft, no image yet)
     candidates = queries.get_posts_by_status(["approved", "draft", "scheduled"])
     if not candidates:
         await update.message.reply_text("No posts in queue to generate an image for.")
         return
 
-    # Prefer posts without an image already
     post = next((p for p in candidates if not p.get("image_url")), candidates[0])
     post_id = post["id"]
     content = post["content"]
-
-    # Extract hook (first non-empty line) for the image headline
     hook = next((l.strip() for l in content.split("\n") if l.strip()), content[:60])
 
     await update.message.reply_text(
-        f"🎨 Generating image via {platform.upper()}...\n"
+        f"🎨 Generating LinkedIn card...\n"
         f"Post: {content[:60]}…\n\n"
-        f"This takes up to 90 seconds. Stay tuned."
+        f"Ready in ~3 seconds."
     )
 
-    # Run generation in background so Telegram doesn't time out
     asyncio.create_task(
         _run_image_generation(
             update=update,
-            platform=platform,
             post_id=post_id,
             topic=_extract_topic_from_signal_card(post),
             hook=hook,
@@ -220,7 +212,6 @@ async def handle_generate_image(update: Update, context: ContextTypes.DEFAULT_TY
 
 
 async def _extract_topic_from_signal_card(post: dict) -> str:
-    """Pull the topic from the signal card, fall back to first line of content."""
     sc = post.get("signal_card") or {}
     if isinstance(sc, dict):
         topic = sc.get("selected_topic") or sc.get("trigger", "")
@@ -231,48 +222,44 @@ async def _extract_topic_from_signal_card(post: dict) -> str:
 
 async def _run_image_generation(
     update,
-    platform: str,
     post_id: str,
     topic: str,
     hook: str,
 ) -> None:
     """
-    Run Playwright image generation and send result to Telegram.
-    Automatically falls back from ChatGPT to Gemini on failure.
+    Generate LinkedIn card image using Pillow (no browser needed).
+    Playwright is blocked on Railway for all external sites.
+    Pillow generates the card instantly, server-side.
     """
     import os
-    from pw.chatgpt_image import generate_image_chatgpt, build_image_prompt
-    from pw.gemini_image import generate_image_gemini
+    from services.image_generator import generate_linkedin_card
 
     image_path = None
-    actual_platform = platform
-    prompt = build_image_prompt(topic=topic, post_hook=hook)
+    actual_platform = "pillow"
 
     try:
-        if platform == "chatgpt":
-            try:
-                image_path = await generate_image_chatgpt(prompt)
-                actual_platform = "chatgpt"
-            except Exception as chatgpt_err:
-                logger.warning(f"[generate_image] ChatGPT failed: {chatgpt_err}. Trying Gemini...")
-                await update.message.reply_text(
-                    f"⚠️ ChatGPT failed: {str(chatgpt_err)[:100]}\n"
-                    f"Falling back to Gemini..."
-                )
-                image_path = await generate_image_gemini(prompt)
-                actual_platform = "gemini"
-        else:
-            image_path = await generate_image_gemini(prompt)
-            actual_platform = "gemini"
+        # Extract hashtags from the post content
+        from db import queries as q
+        posts = q.get_posts_by_status(["approved", "draft", "scheduled"])
+        post = next((p for p in posts if p["id"] == post_id), posts[0] if posts else {})
+        content = post.get("content", "")
+        hashtag_lines = [l.strip() for l in content.split("\n") if l.strip().startswith("#")]
+        hashtags = " ".join(hashtag_lines)[:80] if hashtag_lines else "#ProductManagement #DevToPM #NextLeap"
+
+        image_path = generate_linkedin_card(
+            hook=hook,
+            topic=topic,
+            hashtags=hashtags,
+        )
 
         # Send image to Telegram
         await send_telegram_file(
             file_path=image_path,
             caption=(
-                f"✅ Image generated via {actual_platform.upper()}\n"
+                f"✅ LinkedIn card generated\n"
                 f"Post ID: {post_id[:8]}\n\n"
                 f"Happy with it? Send /approve to schedule the post.\n"
-                f"Want a different image? Send /generate_image {actual_platform} again."
+                f"Want a new card? Send /generate_image again."
             ),
         )
 
@@ -280,8 +267,8 @@ async def _run_image_generation(
         # Store local path as placeholder — Phase 5 dashboard will show it via Telegram
         queries.update_post_image(
             post_id=post_id,
-            image_url=f"telegram://{actual_platform}/{os.path.basename(image_path)}",
-            image_generator=actual_platform,
+            image_url=f"pillow://{os.path.basename(image_path)}",
+            image_generator="pillow",
         )
 
         logger.info(f"[generate_image] Done: {image_path} via {actual_platform}")
