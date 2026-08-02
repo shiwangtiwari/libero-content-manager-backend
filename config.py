@@ -3,21 +3,21 @@ from typing import Optional
 
 
 class Settings(BaseSettings):
-    # Supabase
+    # Supabase — required, must be set before deployment
     SUPABASE_URL: str
     SUPABASE_SERVICE_KEY: str
 
-    # Telegram
-    TELEGRAM_BOT_TOKEN: str
-    TELEGRAM_CHAT_ID: str
+    # Telegram — optional until Telegram bot is created (Step 4)
+    TELEGRAM_BOT_TOKEN: Optional[str] = None
+    TELEGRAM_CHAT_ID: Optional[str] = None
 
-    # LinkedIn
-    LINKEDIN_CLIENT_ID: str
-    LINKEDIN_CLIENT_SECRET: str
+    # LinkedIn — optional until OAuth2 is completed (Step 5)
+    LINKEDIN_CLIENT_ID: Optional[str] = None
+    LINKEDIN_CLIENT_SECRET: Optional[str] = None
     LINKEDIN_ACCESS_TOKEN: Optional[str] = None
     LINKEDIN_PERSON_URN: Optional[str] = None
 
-    # Playwright session cookies (JSON strings)
+    # Playwright session cookies (JSON strings) — optional until Phase 2
     CLAUDE_COOKIES: Optional[str] = None
     CHATGPT_COOKIES: Optional[str] = None
     GEMINI_COOKIES: Optional[str] = None
