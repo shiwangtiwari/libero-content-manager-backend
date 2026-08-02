@@ -1,7 +1,6 @@
-
 """
-playwright/session_loader.py
-----------------------------
+pw/session_loader.py
+--------------------
 Loads a Playwright browser context pre-loaded with session cookies
 for claude.ai, chatgpt.com, or gemini.google.com.
 
@@ -32,12 +31,13 @@ COOKIE_ENV_MAP = {
     "gemini":   "GEMINI_COOKIES",
 }
 
-# Realistic desktop Chrome UA — minimises headless detection
 USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/124.0.0.0 Safari/537.36"
 )
+
+VALID_SAME_SITE = {"Strict", "Lax", "None"}
 
 
 async def get_browser_context(
@@ -76,6 +76,13 @@ async def get_browser_context(
             f"'{env_var}' must be a JSON array starting with '['. Got: {type(cookies).__name__}"
         )
 
+    # Sanitise sameSite values — Cookie-Editor sometimes exports non-standard
+    # values like "unspecified" or "" that Playwright rejects.
+    # Normalise anything invalid to "Lax" as a safe default.
+    for cookie in cookies:
+        if cookie.get("sameSite") not in VALID_SAME_SITE:
+            cookie["sameSite"] = "Lax"
+
     logger.info(f"[session_loader] platform={platform} cookies={len(cookies)}")
 
     pw = await async_playwright().start()
@@ -105,14 +112,7 @@ async def get_browser_context(
         "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
     )
 
-    # Sanitise sameSite values — Cookie-Editor sometimes exports non-standard values
-# like "unspecified" that Playwright rejects. Normalise to "Lax" as safe default.
-valid_same_site = {"Strict", "Lax", "None"}
-for cookie in cookies:
-    if cookie.get("sameSite") not in valid_same_site:
-        cookie["sameSite"] = "Lax"
-
-await context.add_cookies(cookies)
+    await context.add_cookies(cookies)
 
     logger.info(f"[session_loader] Browser context ready for platform={platform}")
     return pw, browser, context
