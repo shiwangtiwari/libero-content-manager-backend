@@ -3,6 +3,10 @@ FROM python:3.11-slim
 ENV DEBIAN_FRONTEND=noninteractive
 
 # ── System dependencies for Chromium ─────────────────────────────────────────
+# All real Chromium runtime dependencies installed here via apt.
+# playwright install --with-deps is NOT used because it tries to install
+# Ubuntu-only font packages (ttf-unifont, ttf-ubuntu-font-family) that don't
+# exist on Debian Trixie and cause the build to fail with exit code 100.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     chromium \
     chromium-driver \
@@ -25,25 +29,21 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # ── Tell Playwright to use system Chromium ────────────────────────────────────
-# PLAYWRIGHT_BROWSERS_PATH tells Playwright where to look for browsers.
-# Setting it to /usr/bin makes it find the system chromium binary directly.
 ENV PLAYWRIGHT_BROWSERS_PATH=/usr/bin
 ENV PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium
-# Skip downloading Playwright's own Chromium — we use the system one above
 ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
 
 WORKDIR /app
 
 COPY requirements.txt .
 
-# ── Install Python deps ───────────────────────────────────────────────────────
 RUN pip install --no-cache-dir -r requirements.txt
 
-# ── Install Playwright Python package explicitly ──────────────────────────────
-# This is separate from requirements.txt to guarantee it runs even if
-# there's a version conflict. The --with-deps flag installs any remaining
-# OS-level libraries Playwright needs that apt-get may have missed.
-RUN pip install playwright==1.44.0 && playwright install --with-deps chromium
+# ── Install Playwright Python package and register browser ────────────────────
+# Use 'playwright install chromium' WITHOUT --with-deps.
+# The --with-deps flag pulls Ubuntu font packages that don't exist on Debian.
+# All actual Chromium system dependencies are already installed above via apt.
+RUN pip install playwright==1.44.0 && playwright install chromium
 
 COPY . .
 
