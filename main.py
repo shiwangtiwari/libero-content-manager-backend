@@ -106,6 +106,8 @@ app.include_router(health.router)
 app.include_router(posts.router)
 app.include_router(linkedin.router)
 app.include_router(inputs.router)
+from routers import internal
+app.include_router(internal.router)
 
 
 @app.get("/")
