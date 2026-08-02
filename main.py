@@ -191,7 +191,7 @@ async def test_claude_playwright(background_tasks: BackgroundTasks):
     )
 
     try:
-        from playwright.claude_generate import generate_linkedin_post
+        from pw.claude_generate import generate_linkedin_post
         claude_response = await generate_linkedin_post(TEST_PROMPT)
         duration = round(asyncio.get_event_loop().time() - start, 2)
 
