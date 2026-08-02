@@ -18,7 +18,7 @@ from .session_loader import get_browser_context
 logger = logging.getLogger(__name__)
 
 # Timeouts (milliseconds)
-NAV_TIMEOUT          = 45_000
+NAV_TIMEOUT          = 90_000
 INPUT_WAIT_TIMEOUT   = 5_000   # per selector attempt
 RESPONSE_START_MS    = 20_000
 RESPONSE_FINISH_MS   = 120_000
