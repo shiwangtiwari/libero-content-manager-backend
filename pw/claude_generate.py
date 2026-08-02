@@ -59,12 +59,12 @@ async def generate_linkedin_post(prompt: str) -> str:
         # claude.ai is a SPA — domcontentloaded fires on the HTML shell,
         # but the chat UI takes 3-5 more seconds to render on Railway.
         await asyncio.sleep(5)
-        
+
         # Also wait for network to go idle — confirms React has finished loading
         try:
             await page.wait_for_load_state("networkidle", timeout=15_000)
         except PlaywrightTimeoutError:
-            pass  # networkidle timeout is fine — just means background requests are still running
+            pass  # networkidle timeout is fine — just means background requests still running
 
         # ── 3. Find input box — try multiple selectors ────────────────────────
         input_selectors = [
@@ -87,7 +87,8 @@ async def generate_linkedin_post(prompt: str) -> str:
 
         if input_box is None:
             await page.screenshot(path="/tmp/claude_no_input.png")
-            # Dump all contenteditable and textbox elements to logs for debugging
+
+            # Dump editable elements
             all_editable = await page.evaluate("""() => {
                 const els = document.querySelectorAll('[contenteditable], [role="textbox"], textarea, .ProseMirror');
                 return Array.from(els).map(el => ({
@@ -100,11 +101,17 @@ async def generate_linkedin_post(prompt: str) -> str:
                 }));
             }""")
             logger.error(f"[claude_generate] Editable elements found: {all_editable}")
-            page_url = page.url
-            logger.error(f"[claude_generate] Current URL: {page_url}")
+            logger.error(f"[claude_generate] Current URL: {page.url}")
+
+            # Dump page title and body so we can see what claude.ai is actually showing
+            page_title = await page.title()
+            page_body = (await page.inner_text("body"))[:800]
+            logger.error(f"[claude_generate] Page title: {page_title}")
+            logger.error(f"[claude_generate] Page body snippet: {page_body}")
+
             raise RuntimeError(
                 "Could not find Claude.ai input box. "
-                "Check Railway logs for 'Editable elements found' to see actual DOM selectors."
+                "Check Railway logs for page title and body snippet to diagnose."
             )
 
         # ── 4. Fill and submit ────────────────────────────────────────────────
