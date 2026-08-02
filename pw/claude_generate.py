@@ -78,10 +78,24 @@ async def generate_linkedin_post(prompt: str) -> str:
 
         if input_box is None:
             await page.screenshot(path="/tmp/claude_no_input.png")
+            # Dump all contenteditable and textbox elements to logs for debugging
+            all_editable = await page.evaluate("""() => {
+                const els = document.querySelectorAll('[contenteditable], [role="textbox"], textarea, .ProseMirror');
+                return Array.from(els).map(el => ({
+                    tag: el.tagName,
+                    role: el.getAttribute('role'),
+                    contenteditable: el.getAttribute('contenteditable'),
+                    class: el.className.substring(0, 80),
+                    dataTestId: el.getAttribute('data-testid'),
+                    placeholder: el.getAttribute('placeholder') || el.getAttribute('data-placeholder'),
+                }));
+            }""")
+            logger.error(f"[claude_generate] Editable elements found: {all_editable}")
+            page_url = page.url
+            logger.error(f"[claude_generate] Current URL: {page_url}")
             raise RuntimeError(
                 "Could not find Claude.ai input box. "
-                "The DOM may have changed. "
-                "Screenshot saved to /tmp/claude_no_input.png — check Railway logs."
+                "Check Railway logs for 'Editable elements found' to see actual DOM selectors."
             )
 
         # ── 4. Fill and submit ────────────────────────────────────────────────
