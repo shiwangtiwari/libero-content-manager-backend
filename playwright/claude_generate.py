@@ -1,86 +1,189 @@
 """
-Claude.ai content generator — Phase 2 component.
-Hits claude.ai with session cookies, submits prompt, extracts response.
-This is the highest-risk component. Validate in Phase 2 before building anything else.
+playwright/claude_generate.py
+------------------------------
+Opens claude.ai with session cookies, submits a prompt, waits for the
+response to finish streaming, and returns the assistant text.
+
+Phase 2: called by /test/claude to validate Railway → Claude.ai connectivity.
+Phase 3: called by the content generation job with the full LinkedIn post prompt.
+
+Selectors current as of claude.ai DOM, August 2025.
+If Claude changes their frontend, update the selectors in _extract_response().
 """
+
 import asyncio
 import logging
-from playwright.session_loader import get_browser_context
+
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+
+from .session_loader import get_browser_context
 
 logger = logging.getLogger(__name__)
 
-CLAUDE_URL = "https://claude.ai/new"
-RESPONSE_SELECTOR = ".font-claude-message"
-STOP_BUTTON_SELECTOR = 'button[aria-label="Stop"]'
-INPUT_SELECTOR = 'div[contenteditable="true"]'
-
-# Timeout constants (ms)
-INPUT_TIMEOUT = 15_000
-STOP_APPEAR_TIMEOUT = 15_000
-STOP_DISAPPEAR_TIMEOUT = 90_000
+# Timeouts (milliseconds)
+NAV_TIMEOUT          = 45_000   # page.goto
+INPUT_WAIT_TIMEOUT   = 15_000   # wait for the text box to appear
+RESPONSE_START_MS    = 20_000   # stop button must appear within this long
+RESPONSE_FINISH_MS   = 120_000  # stop button must disappear within this long
 
 
 async def generate_linkedin_post(prompt: str) -> str:
     """
-    Submit prompt to Claude.ai, wait for response, return text.
-    Raises on session expiry, blocked access, or timeout.
+    Submit a prompt to claude.ai and return the assistant's response as plain text.
+
+    Raises:
+        EnvironmentError  — CLAUDE_COOKIES not set
+        RuntimeError      — navigation, interaction, or extraction failure
     """
-    playwright, browser, context = await get_browser_context("claude")
+    logger.info("[claude_generate] Starting — opening claude.ai")
+
+    pw, browser, context = await get_browser_context("claude")
     try:
         page = await context.new_page()
 
-        logger.info(f"[Claude] Opening {CLAUDE_URL}")
-        await page.goto(CLAUDE_URL, wait_until="networkidle", timeout=30_000)
-
-        # Verify we're logged in (not on /login redirect)
-        if "/login" in page.url or "claude.ai/login" in page.url:
-            raise PermissionError(
-                "Claude session expired. "
-                "Re-export CLAUDE_COOKIES from Cookie-Editor and update Railway var."
+        # ── 1. Navigate ───────────────────────────────────────────────────────
+        try:
+            await page.goto(
+                "https://claude.ai/new",
+                wait_until="domcontentloaded",
+                timeout=NAV_TIMEOUT,
+            )
+        except PlaywrightTimeoutError:
+            raise RuntimeError(
+                "claude.ai/new did not load within 45s. "
+                "Session may be expired — re-export CLAUDE_COOKIES."
             )
 
-        # Type prompt
-        input_box = page.locator(INPUT_SELECTOR).first
-        await input_box.wait_for(state="visible", timeout=INPUT_TIMEOUT)
+        # ── 2. Confirm we landed on the chat UI, not a login/upgrade page ────
+        current_url = page.url
+        if any(kw in current_url for kw in ["login", "upgrade", "onboard", "sign"]):
+            raise RuntimeError(
+                f"Redirected to {current_url} — session cookies are expired or invalid. "
+                "Re-export CLAUDE_COOKIES from claude.ai and update Railway Variables."
+            )
+
+        await asyncio.sleep(1.5)  # SPA needs a moment after navigation
+
+        # ── 3. Find and fill the prompt input ────────────────────────────────
+        input_selector = 'div[contenteditable="true"]'
+        try:
+            await page.wait_for_selector(input_selector, timeout=INPUT_WAIT_TIMEOUT)
+        except PlaywrightTimeoutError:
+            await page.screenshot(path="/tmp/claude_no_input.png")
+            raise RuntimeError(
+                "Could not find Claude.ai input box. "
+                "The DOM may have changed. "
+                "Screenshot saved to /tmp/claude_no_input.png — check Railway logs."
+            )
+
+        input_box = page.locator(input_selector).first
+        await input_box.click()
+        await asyncio.sleep(0.3)
         await input_box.fill(prompt)
+        await asyncio.sleep(0.8)  # settle before submitting
+
+        # ── 4. Submit ─────────────────────────────────────────────────────────
+        logger.info("[claude_generate] Submitting prompt")
         await page.keyboard.press("Enter")
 
-        # Wait for Stop button to appear (generation started)
-        await page.wait_for_selector(STOP_BUTTON_SELECTOR, timeout=STOP_APPEAR_TIMEOUT)
-        logger.info("[Claude] Generation started...")
+        # ── 5. Wait for response to start (stop button appears) ───────────────
+        try:
+            await page.wait_for_selector(
+                'button[aria-label="Stop"]',
+                timeout=RESPONSE_START_MS,
+            )
+        except PlaywrightTimeoutError:
+            # May already be done (very short response) — fall through to extraction
+            logger.warning(
+                "[claude_generate] Stop button never appeared — "
+                "response may have been instantaneous"
+            )
 
-        # Wait for Stop button to disappear (generation complete)
-        await page.wait_for_selector(
-            STOP_BUTTON_SELECTOR, state="hidden", timeout=STOP_DISAPPEAR_TIMEOUT
-        )
-        logger.info("[Claude] Generation complete.")
+        # ── 6. Wait for response to finish (stop button disappears) ───────────
+        try:
+            await page.wait_for_selector(
+                'button[aria-label="Stop"]',
+                state="hidden",
+                timeout=RESPONSE_FINISH_MS,
+            )
+        except PlaywrightTimeoutError:
+            raise RuntimeError(
+                "Claude response did not finish streaming within 120s. "
+                "Prompt may be too long, or Railway is slow. "
+                "Try again or increase RESPONSE_FINISH_MS."
+            )
 
-        # Extract the last assistant message
-        messages = await page.locator(RESPONSE_SELECTOR).all()
-        if not messages:
-            raise RuntimeError("No response message found from Claude. Page may have changed structure.")
+        await asyncio.sleep(1.0)  # brief tail before scraping
 
-        response_text = await messages[-1].inner_text()
-        return response_text.strip()
+        # ── 7. Extract response text ──────────────────────────────────────────
+        response_text = await _extract_response(page)
+        logger.info(f"[claude_generate] Done — {len(response_text)} chars extracted")
+        return response_text
 
     finally:
         await browser.close()
-        await playwright.stop()
+        await pw.stop()
+        logger.info("[claude_generate] Browser closed")
 
 
-async def health_check_claude() -> dict:
+async def _extract_response(page) -> str:
     """
-    Lightweight health check — opens claude.ai and verifies we're logged in.
-    Used by the session health job in Phase 6.
-    Returns {"healthy": bool, "error": str | None}
+    Extract the last assistant message from the page.
+    Tries three selectors in order — most specific first.
     """
+    # Primary: class used on assistant message bubbles
+    messages = await page.locator(".font-claude-message").all()
+    if messages:
+        text = await messages[-1].inner_text()
+        if text and text.strip():
+            return text.strip()
+
+    # Fallback 1: data-testid attribute
+    messages = await page.locator('[data-testid="assistant-message"]').all()
+    if messages:
+        text = await messages[-1].inner_text()
+        if text and text.strip():
+            return text.strip()
+
+    # Fallback 2: role attribute
+    messages = await page.locator('[data-message-author-role="assistant"]').all()
+    if messages:
+        text = await messages[-1].inner_text()
+        if text and text.strip():
+            return text.strip()
+
+    # Nothing worked — log page body for debugging
+    body_snippet = (await page.inner_text("body"))[:500]
+    logger.error(f"[claude_generate] No response found. Page body: {body_snippet}")
+    raise RuntimeError(
+        "No assistant response found on the page. "
+        "Claude.ai DOM may have changed — check Railway logs for page body snippet "
+        "and update selectors in _extract_response()."
+    )
+
+
+async def validate_session() -> dict:
+    """
+    Quick health check: can we open claude.ai with current cookies?
+    Returns {"is_healthy": bool, "url_after_load": str, "error": str|None}
+    Called by GET /health/sessions.
+    """
+    result = {"is_healthy": False, "url_after_load": None, "error": None}
     try:
-        playwright, browser, context = await get_browser_context("claude")
-        page = await context.new_page()
-        await page.goto(CLAUDE_URL, wait_until="networkidle", timeout=20_000)
-        is_logged_in = "/login" not in page.url
-        await browser.close()
-        await playwright.stop()
-        return {"healthy": is_logged_in, "error": None if is_logged_in else "Session expired — redirected to login"}
+        pw, browser, context = await get_browser_context("claude")
+        try:
+            page = await context.new_page()
+            await page.goto("https://claude.ai", wait_until="domcontentloaded", timeout=30_000)
+            url = page.url
+            result["url_after_load"] = url
+            result["is_healthy"] = not any(
+                kw in url for kw in ["login", "upgrade", "onboard", "sign"]
+            )
+            if not result["is_healthy"]:
+                result["error"] = f"Redirected to {url} — session expired"
+        finally:
+            await browser.close()
+            await pw.stop()
     except Exception as e:
-        return {"healthy": False, "error": str(e)}
+        result["error"] = str(e)
+    return result
