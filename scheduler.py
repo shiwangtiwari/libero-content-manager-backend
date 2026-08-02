@@ -95,8 +95,46 @@ async def job_check_session_health():
     logger.info("[Scheduler] Session health check — Phase 6 feature, skipped for now.")
 
 
+# ── Phase 3: Content generation jobs ─────────────────────────────────────────
+# Runs Mon/Tue/Wed at 6:00 AM IST — 26-30 hours before posting time.
+# Monday   6 AM → generates for Tuesday  8:30 AM post
+# Tuesday  6 AM → generates for Wednesday 12:00 PM post
+# Wednesday 6 AM → generates for Thursday 9:00 AM post
+
+async def job_generate_content():
+    """
+    Phase 3: Full content pipeline.
+    Collects signals → selects topic → generates via Anthropic API
+    → saves to Supabase → sends Telegram notification with draft + signal card.
+    """
+    logger.info("[Scheduler] Content generation job fired")
+    try:
+        from services.content_pipeline import run_content_pipeline
+        result = await run_content_pipeline()
+        if result["success"]:
+            logger.info(
+                "[Scheduler] Content pipeline succeeded: post_id=%s topic='%s'",
+                result.get("post_id"), result.get("topic", "")[:50],
+            )
+        else:
+            logger.error(
+                "[Scheduler] Content pipeline failed: %s", result.get("error")
+            )
+    except Exception as e:
+        logger.error(f"[Scheduler] Content generation job exception: {e}", exc_info=True)
+        try:
+            from routers.telegram import send_telegram_message
+            await send_telegram_message(
+                f"❌ <b>Content generation job crashed</b>\n\n"
+                f"<b>Error:</b> {str(e)[:300]}\n\n"
+                f"Check Railway logs."
+            )
+        except Exception:
+            pass
+
+
 def start_scheduler():
-    # Posting jobs
+    # ── Posting jobs ──────────────────────────────────────────────────────────
     scheduler.add_job(
         job_post_tuesday,
         CronTrigger(day_of_week="tue", hour=8, minute=30, timezone=IST),
@@ -116,7 +154,7 @@ def start_scheduler():
         replace_existing=True,
     )
 
-    # Missed approval check — every 5 minutes
+    # ── Missed approval check — every 5 minutes ───────────────────────────────
     scheduler.add_job(
         job_check_missed_approvals,
         "interval",
@@ -125,7 +163,7 @@ def start_scheduler():
         replace_existing=True,
     )
 
-    # Session health — every 6 hours
+    # ── Session health — every 6 hours ────────────────────────────────────────
     scheduler.add_job(
         job_check_session_health,
         "interval",
@@ -134,5 +172,36 @@ def start_scheduler():
         replace_existing=True,
     )
 
+    # ── Phase 3: Content generation — Mon/Tue/Wed at 6:00 AM IST ─────────────
+    scheduler.add_job(
+        job_generate_content,
+        CronTrigger(day_of_week="mon", hour=6, minute=0, timezone=IST),
+        id="generate_monday",
+        name="Generate content for Tuesday post",
+        replace_existing=True,
+        misfire_grace_time=3600,  # tolerate up to 1 hour Railway restart delay
+    )
+    scheduler.add_job(
+        job_generate_content,
+        CronTrigger(day_of_week="tue", hour=6, minute=0, timezone=IST),
+        id="generate_tuesday",
+        name="Generate content for Wednesday post",
+        replace_existing=True,
+        misfire_grace_time=3600,
+    )
+    scheduler.add_job(
+        job_generate_content,
+        CronTrigger(day_of_week="wed", hour=6, minute=0, timezone=IST),
+        id="generate_wednesday",
+        name="Generate content for Thursday post",
+        replace_existing=True,
+        misfire_grace_time=3600,
+    )
+
     scheduler.start()
-    logger.info("[Scheduler] APScheduler started. Jobs: post_tuesday, post_wednesday, post_thursday, missed_approvals, session_health")
+    logger.info(
+        "[Scheduler] APScheduler started. Jobs: "
+        "post_tuesday, post_wednesday, post_thursday, "
+        "missed_approvals, session_health, "
+        "generate_monday, generate_tuesday, generate_wednesday"
+    )
