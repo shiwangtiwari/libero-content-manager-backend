@@ -1,13 +1,8 @@
 name: Generate LinkedIn Content
 
-# Triggered by Railway via repository_dispatch event
-# Railway calls GitHub API: POST /repos/{owner}/{repo}/dispatches
-# with event_type: "generate_content"
 on:
   repository_dispatch:
     types: [generate_content]
-
-  # Also allow manual trigger from GitHub Actions tab for testing
   workflow_dispatch:
     inputs:
       topic:
@@ -33,11 +28,14 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install dependencies
-        run: |
-          pip install playwright==1.44.0 httpx
-          playwright install chromium
-          playwright install-deps chromium
+      - name: Install missing Chromium dependency
+        run: sudo apt-get install -y libasound2t64
+
+      - name: Install Python packages
+        run: pip install playwright==1.44.0 httpx
+
+      - name: Install Playwright Chromium browser
+        run: playwright install chromium
 
       - name: Run content generation
         env:
