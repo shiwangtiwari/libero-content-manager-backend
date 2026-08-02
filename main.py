@@ -105,6 +105,7 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
+        "https://libero-content-manager-frontend.vercel.app",
         "https://libero-dashboard.vercel.app",
         "http://localhost:3001",
         "http://localhost:5173",
