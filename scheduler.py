@@ -10,13 +10,13 @@ import asyncio
 import logging
 from datetime import datetime
 import pytz
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 
 logger = logging.getLogger(__name__)
 IST = pytz.timezone("Asia/Kolkata")
 
-scheduler = AsyncIOScheduler(timezone=IST)
+scheduler = BackgroundScheduler(timezone=IST)
 
 
 async def job_post_tuesday():
