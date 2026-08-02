@@ -325,7 +325,11 @@ async def handle_generate_image(update: Update, context: ContextTypes.DEFAULT_TY
 async def handle_photo_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     When you send a photo to the bot after /generate_image,
-    this handler attaches it to the pending post and saves to Supabase.
+    this handler:
+    1. Downloads the image from Telegram
+    2. Uploads it to Supabase Storage (public bucket: post-images)
+    3. Saves the public URL to the post row in Supabase
+    4. Dashboard can then display the image via the public URL
     """
     global _pending_image_post_id
 
@@ -335,44 +339,78 @@ async def handle_photo_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if not _pending_image_post_id:
         await update.message.reply_text(
             "No pending post waiting for an image.\n"
-            "Send /generate_image first to get the prompt, then send the image here."
+            "Send /generate_image first, then send the image here."
         )
         return
 
     post_id = _pending_image_post_id
 
     try:
-        # Get the highest resolution photo Telegram received
-        photo = update.message.photo[-1]
-        file = await context.bot.get_file(photo.file_id)
-
-        # Download to temp file
         import os, time
-        save_path = f"/tmp/libero_user_image_{int(time.time())}.jpg"
+        from db.supabase_client import get_supabase
+
+        # 1. Download from Telegram
+        photo = update.message.photo[-1]  # highest resolution
+        file = await context.bot.get_file(photo.file_id)
+        save_path = f"/tmp/libero_img_{int(time.time())}.jpg"
         await file.download_to_drive(save_path)
 
         file_size = os.path.getsize(save_path)
-        logger.info(f"[handle_photo] Received image: {save_path} ({file_size} bytes) for post {post_id[:8]}")
+        logger.info(f"[handle_photo] Downloaded: {save_path} ({file_size} bytes) for post {post_id[:8]}")
 
-        # Save reference in Supabase
+        # 2. Upload to Supabase Storage
+        storage_path = f"posts/{post_id[:8]}_{int(time.time())}.jpg"
+        public_url = None
+
+        try:
+            supabase = get_supabase()
+            with open(save_path, "rb") as f:
+                image_bytes = f.read()
+
+            # Upload to 'post-images' bucket
+            supabase.storage.from_("post-images").upload(
+                path=storage_path,
+                file=image_bytes,
+                file_options={"content-type": "image/jpeg", "upsert": "true"},
+            )
+
+            # Get public URL
+            url_response = supabase.storage.from_("post-images").get_public_url(storage_path)
+            public_url = url_response
+            logger.info(f"[handle_photo] Uploaded to Supabase Storage: {public_url}")
+
+        except Exception as storage_err:
+            logger.warning(f"[handle_photo] Supabase Storage upload failed: {storage_err}")
+            # Fall back to storing local path reference
+            public_url = f"telegram://user_upload/{os.path.basename(save_path)}"
+
+        # 3. Save URL to Supabase posts table
         queries.update_post_image(
             post_id=post_id,
-            image_url=f"telegram://user_upload/{os.path.basename(save_path)}",
+            image_url=public_url,
             image_generator="user_upload",
         )
+
+        # 4. Cleanup temp file
+        try:
+            os.remove(save_path)
+        except Exception:
+            pass
 
         _pending_image_post_id = None
 
         post = queries.get_post_by_id(post_id)
         status = post.get("status", "draft") if post else "draft"
+        stored_ok = not public_url.startswith("telegram://")
 
         await update.message.reply_text(
             f"✅ <b>Image attached to post {post_id[:8]}</b>\n\n"
-            f"Post status: <b>{status}</b>\n\n"
+            f"Post status: <b>{status}</b>\n"
+            f"Image stored: <b>{'Supabase Storage ✓' if stored_ok else 'local ref (Storage upload failed)'}</b>\n\n"
             + (
-                f"The post is approved and will go live at the scheduled time with this image."
+                "The post is approved and will go live at the scheduled time with this image."
                 if status == "approved" else
-                f"Send /approve to approve the post — it will publish with this image."
+                "Send /approve to approve the post — it will publish with this image."
             ),
             parse_mode="HTML",
         )
@@ -380,7 +418,7 @@ async def handle_photo_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
     except Exception as e:
         logger.error(f"[handle_photo] Failed: {e}", exc_info=True)
         await update.message.reply_text(
-            f"❌ Failed to save image: {e}\n\nTry sending the image again."
+            f"❌ Failed to save image: {str(e)[:200]}\n\nTry sending the image again."
         )
 
 
