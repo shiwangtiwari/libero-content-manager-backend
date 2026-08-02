@@ -1,0 +1,51 @@
+name: Generate LinkedIn Content
+
+# Triggered by Railway via repository_dispatch event
+# Railway calls GitHub API: POST /repos/{owner}/{repo}/dispatches
+# with event_type: "generate_content"
+on:
+  repository_dispatch:
+    types: [generate_content]
+
+  # Also allow manual trigger from GitHub Actions tab for testing
+  workflow_dispatch:
+    inputs:
+      topic:
+        description: 'Topic to write about (leave blank for test)'
+        required: false
+        default: 'test'
+      post_id:
+        description: 'Supabase post ID to update (leave blank for test)'
+        required: false
+        default: 'test'
+
+jobs:
+  generate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install playwright==1.44.0 httpx
+          playwright install chromium
+          playwright install-deps chromium
+
+      - name: Run content generation
+        env:
+          CLAUDE_COOKIES: ${{ secrets.CLAUDE_COOKIES }}
+          RAILWAY_CALLBACK_URL: ${{ secrets.RAILWAY_CALLBACK_URL }}
+          RAILWAY_INTERNAL_SECRET: ${{ secrets.RAILWAY_INTERNAL_SECRET }}
+          TOPIC: ${{ github.event.client_payload.topic || github.event.inputs.topic || 'test' }}
+          POST_ID: ${{ github.event.client_payload.post_id || github.event.inputs.post_id || 'test' }}
+          SIGNAL_CARD: ${{ github.event.client_payload.signal_card || '{}' }}
+          LAST_TOPICS: ${{ github.event.client_payload.last_topics || '' }}
+        run: python github_actions/run_generation.py
