@@ -22,8 +22,8 @@ from .session_loader import get_browser_context
 
 logger = logging.getLogger(__name__)
 
-NAV_TIMEOUT = 60_000
-IMAGE_WAIT_TIMEOUT = 90_000
+NAV_TIMEOUT = 120_000
+IMAGE_WAIT_TIMEOUT = 120_000
 DOWNLOAD_TIMEOUT = 30
 
 
@@ -59,7 +59,11 @@ async def generate_image_gemini(prompt: str, save_path: str | None = None) -> st
                 timeout=NAV_TIMEOUT,
             )
         except PlaywrightTimeoutError:
-            raise RuntimeError("gemini.google.com did not load within 60s.")
+            raise RuntimeError(
+                "gemini.google.com did not load within 120s on Railway. "
+                "GEMINI_COOKIES are likely not set or expired. "
+                "Export cookies from gemini.google.com using Cookie-Editor and add to Railway Variables."
+            )
 
         current_url = page.url
         if any(kw in current_url for kw in ["accounts.google", "signin", "login"]):
