@@ -21,7 +21,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from config import settings
 from scheduler import start_scheduler
-from routers import health, posts, linkedin, inputs, profile
+from routers import health, posts, linkedin, inputs
 
 logging.basicConfig(
     level=logging.INFO,
@@ -60,6 +60,29 @@ async def lifespan(app: FastAPI):
             )
             logger.info("Telegram polling started.")
 
+            # Register bot commands with Telegram (shows / menu in chat)
+            try:
+                import httpx as _httpx
+                _commands = [
+                    {"command": "approve",        "description": "Confirm the latest draft post"},
+                    {"command": "reject",         "description": "Discard draft, generate a replacement"},
+                    {"command": "edit",           "description": "Edit draft: /edit <new text>"},
+                    {"command": "strip",          "description": "Remove **markdown** from draft"},
+                    {"command": "reschedule",     "description": "Move post to next available slot"},
+                    {"command": "generate_image", "description": "Get AI image prompt for pending post"},
+                    {"command": "queue",          "description": "View all pending posts and slots"},
+                    {"command": "status",         "description": "System health and next scheduled post"},
+                    {"command": "run_now",        "description": "Trigger content generation now"},
+                ]
+                async with _httpx.AsyncClient(timeout=10) as _hc:
+                    await _hc.post(
+                        f"https://api.telegram.org/bot{settings.TELEGRAM_BOT_TOKEN}/setMyCommands",
+                        json={"commands": _commands},
+                    )
+                logger.info("Bot commands registered with Telegram.")
+            except Exception as e:
+                logger.warning(f"Bot command registration failed (non-fatal): {e}")
+
             # Startup notification — failure here never crashes the app
             try:
                 from routers.telegram import send_telegram_message
@@ -67,9 +90,10 @@ async def lifespan(app: FastAPI):
                 import pytz
                 ist_now = datetime.now(pytz.timezone("Asia/Kolkata")).strftime("%Y-%m-%d %H:%M IST")
                 await send_telegram_message(
-                    f"🟢 <b>Libero is online</b>\n"
-                    f"Started at {ist_now}\n"
-                    f"Phase 3 active — content pipeline ready.\n"
+                    f"<b>[LIBERO ONLINE]</b>\n\n"
+                    f"<code>STARTED    {ist_now}\n"
+                    f"SCHEDULER  RUNNING\n"
+                    f"PIPELINE   READY</code>\n\n"
                     f"Send /status to check system health."
                 )
             except Exception as e:
@@ -119,7 +143,6 @@ app.include_router(health.router)
 app.include_router(posts.router)
 app.include_router(linkedin.router)
 app.include_router(inputs.router)
-app.include_router(profile.router)
 from routers import internal
 app.include_router(internal.router)
 
