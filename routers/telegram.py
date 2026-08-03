@@ -141,6 +141,30 @@ async def handle_reject(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await update.message.reply_text(f"❌ {result['error']}")
         return
 
+    # Trigger immediate regeneration if there's still time before the slot
+    rejected_post = queries.get_posts_by_status(["draft", "pending_reschedule"])
+    # The post we just rejected is now "rejected" — find its slot from the result
+    try:
+        from datetime import datetime
+        import pytz
+        IST_tz = pytz.timezone("Asia/Kolkata")
+        rejected_row = queries.get_post_by_id(post_id)
+        slot = rejected_row.get("scheduled_time") if rejected_row else None
+        if slot:
+            slot_dt = IST_tz.localize(datetime.strptime(slot, "%Y-%m-%d %H:%M"))
+            hours_left = (slot_dt - datetime.now(IST_tz)).total_seconds() / 3600
+            if hours_left > 1:
+                from services.content_pipeline import run_content_pipeline
+                asyncio.create_task(run_content_pipeline())
+                await update.message.reply_text(
+                    f"🗑 Post rejected.\n\n"
+                    f"⚙️ Generating a replacement for {slot} IST...\n"
+                    f"New draft arrives in ~30 seconds."
+                )
+                return
+    except Exception as e:
+        logger.warning("Post-reject regen trigger failed: %s", e)
+
     await update.message.reply_text("🗑 Post rejected. A new draft will be generated in the next content cycle.")
 
 
@@ -469,9 +493,105 @@ async def handle_run_now(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.message.reply_text(f"❌ Pipeline trigger failed: {e}")
 
 
+
+
+# ── Command: /edit ────────────────────────────────────────────────────────────
+
+async def handle_edit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Usage:
+      /edit <new content here>         — replaces the latest draft's content
+      /edit <post_id> <new content>    — replaces a specific post's content
+
+    The new content is everything after the command (and optional post ID).
+    Example: /edit Most PMs I know are solving hard problems daily but their
+             LinkedIn looks like a ghost town.\n\nHere's what I learned...
+    """
+    if not context.args:
+        await update.message.reply_text(
+            "Usage:\n"
+            "/edit <new content>\n"
+            "or\n"
+            "/edit <post_id_first_8_chars> <new content>\n\n"
+            "Replaces the draft content with your text.",
+            parse_mode="HTML",
+        )
+        return
+
+    # Check if first arg looks like a post ID (8 hex chars)
+    import re
+    first_arg = context.args[0]
+    if re.match(r'^[0-9a-f-]{8,36}$', first_arg, re.I) and len(context.args) > 1:
+        # First arg is a post ID
+        post_id_fragment = first_arg
+        new_content = " ".join(context.args[1:]).strip()
+
+        # Find the post by ID fragment
+        drafts = queries.get_posts_by_status(["draft", "approved", "pending_reschedule"])
+        post = next((p for p in drafts if p["id"].startswith(post_id_fragment) or p["id"][:8].upper() == post_id_fragment.upper()), None)
+        if not post:
+            await update.message.reply_text(f"❌ No draft found with ID starting with {post_id_fragment}")
+            return
+    else:
+        # No post ID — use most recent draft
+        drafts = queries.get_posts_by_status(["draft", "approved", "pending_reschedule"])
+        if not drafts:
+            await update.message.reply_text("No draft posts to edit.")
+            return
+        post = drafts[0]
+        new_content = " ".join(context.args).strip()
+
+    if not new_content:
+        await update.message.reply_text("❌ New content cannot be empty.")
+        return
+
+    # Strip any markdown bold that slipped in
+    new_content = new_content.replace("**", "").replace("__", "")
+
+    # Save to Supabase
+    queries.update_post_content(post["id"], new_content)
+
+    await update.message.reply_text(
+        f"✅ Draft updated!\n\n"
+        f"<i>{new_content[:200]}{'...' if len(new_content) > 200 else ''}</i>\n\n"
+        f"Send /approve to approve it.",
+        parse_mode="HTML",
+    )
+
+
+# ── Command: /strip ───────────────────────────────────────────────────────────
+
+async def handle_strip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /strip — removes **bold** markdown from the latest draft.
+    Quick fix before posting if asterisks are showing in the content.
+    """
+    drafts = queries.get_posts_by_status(["draft", "approved", "pending_reschedule"])
+    if not drafts:
+        await update.message.reply_text("No draft posts found.")
+        return
+
+    post = drafts[0]
+    original = post.get("content", "")
+    cleaned = original.replace("**", "").replace("__", "")
+
+    if cleaned == original:
+        await update.message.reply_text("✓ No markdown formatting found — content is already clean.")
+        return
+
+    queries.update_post_content(post["id"], cleaned)
+    await update.message.reply_text(
+        f"✅ Markdown stripped!\n\n"
+        f"<i>{cleaned[:200]}{'...' if len(cleaned) > 200 else ''}</i>\n\n"
+        f"Send /approve to approve it.",
+        parse_mode="HTML",
+    )
+
 def build_telegram_app() -> Application:
     app = Application.builder().token(settings.TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CommandHandler("approve", handle_approve))
+    app.add_handler(CommandHandler("edit", handle_edit))
+    app.add_handler(CommandHandler("strip", handle_strip))
     app.add_handler(CommandHandler("reject", handle_reject))
     app.add_handler(CommandHandler("reschedule", handle_reschedule))
     app.add_handler(CommandHandler("status", handle_status))
