@@ -2,8 +2,13 @@
 Telegram bot command handlers.
 Bot runs in polling mode (not webhook) as a background task inside FastAPI.
 
-Aesthetic: system terminal style. No emojis. Bracketed markers instead.
-[CONFIRMED] [REJECTED] [ERROR] [WARN] [SIGNAL] [RUNNING] [SCHEDULED]
+Aesthetic: system terminal style. Bracketed markers instead of emojis.
+[CONFIRMED] [REJECTED] [RESCHEDULED] [EXPIRED] [UPDATED] [SIGNAL SAVED]
+[IMAGE PROMPT] [IMAGE SAVED] [RUNNING] [STRIPPED] [POSTED] [POST FAILED]
+
+LIBERO is the system name — not "Claude". Session health shows LIBERO, not CLAUDE.
+
+_pending_image_post_id is stored in Supabase user_profile table (survives restarts).
 """
 import asyncio
 import logging
@@ -19,6 +24,13 @@ from services.post_manager import approve_post, reject_post, reschedule_post
 logger = logging.getLogger(__name__)
 IST = pytz.timezone("Asia/Kolkata")
 
+# Display names for session health — maps DB platform name → human label
+_PLATFORM_DISPLAY = {
+    "claude":  "LIBERO",      # The content generation engine is Libero, not Claude
+    "chatgpt": "CHATGPT",
+    "gemini":  "GEMINI",
+}
+
 _bot: Bot | None = None
 
 
@@ -30,6 +42,7 @@ def get_bot() -> Bot:
 
 
 async def send_telegram_message(text: str, parse_mode: str = "HTML") -> None:
+    """Send a message to Shiwang's Telegram. Called from any service."""
     bot = get_bot()
     await bot.send_message(
         chat_id=settings.TELEGRAM_CHAT_ID,
@@ -39,6 +52,7 @@ async def send_telegram_message(text: str, parse_mode: str = "HTML") -> None:
 
 
 async def send_telegram_file(file_path: str, caption: str = "") -> None:
+    """Send a file to Shiwang's Telegram."""
     bot = get_bot()
     with open(file_path, "rb") as f:
         await bot.send_document(
@@ -48,6 +62,8 @@ async def send_telegram_file(file_path: str, caption: str = "") -> None:
         )
 
 
+# ── Command: /status ──────────────────────────────────────────────────────────
+
 async def handle_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     now_ist = datetime.now(IST).strftime("%Y-%m-%d %H:%M IST")
     health = queries.get_all_session_health()
@@ -55,8 +71,9 @@ async def handle_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     health_lines = ""
     for h in health:
+        name = _PLATFORM_DISPLAY.get(h["platform"], h["platform"].upper())
         status = "ONLINE" if h["is_healthy"] else "FAULT"
-        health_lines += f"\n  {h['platform'].upper():<12} {status}"
+        health_lines += f"\n  {name:<12} {status}"
 
     next_post = None
     for post in sorted(queue, key=lambda p: p.get("scheduled_time") or ""):
@@ -74,22 +91,24 @@ async def handle_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         f"<code>{now_ist}</code>\n\n"
         f"<b>SESSION HEALTH</b>"
         f"<code>{health_lines}</code>\n\n"
-        f"<b>SCHEDULE</b>\n"
+        f"<b>QUEUE</b>\n"
         f"<code>{next_info}\n"
-        f"  QUEUE       {len(queue)} post(s)</code>"
+        f"  COUNT       {len(queue)} post(s)</code>"
     )
     await update.message.reply_text(msg, parse_mode="HTML")
 
+
+# ── Command: /queue ───────────────────────────────────────────────────────────
 
 async def handle_queue(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     posts = queries.get_posts_by_status(["draft", "approved", "scheduled", "pending_reschedule"])
     if not posts:
         await update.message.reply_text(
             "<b>QUEUE EMPTY</b>\n\n"
-            "<code>Auto-generation schedule:\n"
-            "  MON 06:00 IST  draft for TUE post\n"
-            "  TUE 06:00 IST  draft for WED post\n"
-            "  WED 06:00 IST  draft for THU post</code>",
+            "<code>Auto-generation schedule (IST):\n"
+            "  MON 06:00  draft for TUE post\n"
+            "  TUE 06:00  draft for WED post\n"
+            "  WED 06:00  draft for THU post</code>",
             parse_mode="HTML",
         )
         return
@@ -110,7 +129,10 @@ async def handle_queue(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
 
+# ── Command: /approve ─────────────────────────────────────────────────────────
+
 async def handle_approve(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Usage: /approve  or  /approve <post_id>"""
     post_id = context.args[0] if context.args else None
     if not post_id:
         drafts = queries.get_posts_by_status(["draft", "pending_reschedule"])
@@ -135,6 +157,8 @@ async def handle_approve(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     )
 
 
+# ── Command: /reject ──────────────────────────────────────────────────────────
+
 async def handle_reject(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     post_id = context.args[0] if context.args else None
     if not post_id:
@@ -144,15 +168,18 @@ async def handle_reject(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             return
         post_id = drafts[0]["id"]
 
+    # Fetch slot BEFORE rejecting so we can check time remaining
+    pre_reject = queries.get_post_by_id(post_id)
+    slot = pre_reject.get("scheduled_time") if pre_reject else None
+
     result = reject_post(post_id)
     if result.get("error"):
         await update.message.reply_text(f"[ERROR] {result['error']}")
         return
 
-    try:
-        rejected_row = queries.get_post_by_id(post_id)
-        slot = rejected_row.get("scheduled_time") if rejected_row else None
-        if slot:
+    # Trigger immediate regeneration if slot is still >1 hour away
+    if slot:
+        try:
             slot_dt = IST.localize(datetime.strptime(slot, "%Y-%m-%d %H:%M"))
             hours_left = (slot_dt - datetime.now(IST)).total_seconds() / 3600
             if hours_left > 1:
@@ -167,15 +194,17 @@ async def handle_reject(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                     parse_mode="HTML",
                 )
                 return
-    except Exception as e:
-        logger.warning("Post-reject regen trigger failed: %s", e)
+        except Exception as e:
+            logger.warning("Post-reject regen trigger failed: %s", e)
 
     await update.message.reply_text(
         "<b>[REJECTED]</b>\n\n"
-        "Post discarded. New draft in the next content cycle.",
+        "Post discarded. New draft will be generated in the next content cycle.",
         parse_mode="HTML",
     )
 
+
+# ── Command: /reschedule ──────────────────────────────────────────────────────
 
 async def handle_reschedule(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     post_id = context.args[0] if context.args else None
@@ -207,7 +236,14 @@ async def handle_reschedule(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     )
 
 
+# ── Command: /edit ────────────────────────────────────────────────────────────
+
 async def handle_edit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /edit <new content>
+    /edit <post_id_8chars> <new content>
+    Strips **bold** markdown automatically. LinkedIn limit: 3000 chars.
+    """
     if not context.args:
         await update.message.reply_text(
             "<b>USAGE</b>\n\n"
@@ -222,7 +258,8 @@ async def handle_edit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if re.match(r'^[0-9a-f-]{8,36}$', first_arg, re.I) and len(context.args) > 1:
         drafts = queries.get_posts_by_status(["draft", "approved", "pending_reschedule"])
         post = next(
-            (p for p in drafts if p["id"].lower().startswith(first_arg.lower())
+            (p for p in drafts
+             if p["id"].lower().startswith(first_arg.lower())
              or p["id"][:8].upper() == first_arg.upper()),
             None
         )
@@ -262,7 +299,10 @@ async def handle_edit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     )
 
 
+# ── Command: /strip ───────────────────────────────────────────────────────────
+
 async def handle_strip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Removes **bold** markdown from the latest draft."""
     drafts = queries.get_posts_by_status(["draft", "approved", "pending_reschedule"])
     if not drafts:
         await update.message.reply_text("[ERROR] No draft posts found.")
@@ -291,13 +331,16 @@ async def handle_strip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     )
 
 
-_pending_image_post_id: str | None = None
-
+# ── Command: /generate_image ──────────────────────────────────────────────────
 
 def _build_image_prompt(post: dict) -> str:
     content = post.get("content", "")
     signal_card = post.get("signal_card") or {}
-    topic = (signal_card.get("selected_topic") or signal_card.get("trigger", "") or "Product Management")[:80]
+    topic = (
+        signal_card.get("selected_topic")
+        or signal_card.get("trigger", "")
+        or "Product Management"
+    )[:80]
     hook = next((l.strip() for l in content.split("\n") if l.strip()), content[:80])
 
     return (
@@ -309,16 +352,14 @@ def _build_image_prompt(post: dict) -> str:
         f"- A visual scene representing the theme metaphorically\n"
         f"- Warm professional palette: navy, amber, or teal\n"
         f"- Cinematic lighting with depth of field\n"
-        f"- NO text on the image\n"
+        f"- NO text on the image whatsoever\n"
         f"- Format: 1200x627px (LinkedIn 1.91:1 ratio)\n"
         f"- Mood: thought-provoking, professional\n\n"
-        f"AVOID: generic handshakes, suits, clipart, any typography on image"
+        f"AVOID: generic handshakes, suits, clipart, any typography on the image"
     )
 
 
 async def handle_generate_image(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    global _pending_image_post_id
-
     posts = queries.get_posts_by_status(["approved", "draft", "scheduled"])
     if not posts:
         await update.message.reply_text("[ERROR] No posts in queue. Run /run_now first.")
@@ -355,7 +396,9 @@ async def handle_generate_image(update: Update, context: ContextTypes.DEFAULT_TY
         )
         return
 
-    _pending_image_post_id = post["id"]
+    # Persist the pending post ID to Supabase (survives Railway restarts)
+    queries.set_pending_image_post(post["id"])
+
     prompt = _build_image_prompt(post)
     hook = next((l.strip() for l in post["content"].split("\n") if l.strip()), "")
     has_image_already = bool(post.get("image_url"))
@@ -366,9 +409,9 @@ async def handle_generate_image(update: Update, context: ContextTypes.DEFAULT_TY
         + f"\n<code>POST ID    {post['id'][:8].upper()}\n"
         f"HOOK       {hook[:65]}...</code>\n\n"
         f"<b>STEPS</b>\n"
-        f"1. Copy prompt below\n"
+        f"1. Copy the prompt below\n"
         f"2. Paste into ChatGPT / Gemini / Grok\n"
-        f"3. Download the image\n"
+        f"3. Download the generated image\n"
         f"4. Send it here as a photo\n\n"
         f"<b>PROMPT</b>\n\n"
         f"<code>{prompt}</code>\n\n"
@@ -377,27 +420,35 @@ async def handle_generate_image(update: Update, context: ContextTypes.DEFAULT_TY
     )
 
 
-async def handle_photo_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    global _pending_image_post_id
+# ── Photo handler ─────────────────────────────────────────────────────────────
 
+async def handle_photo_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Receives the image sent after /generate_image.
+    Pending post ID is read from Supabase — survives Railway restarts.
+    """
     if str(update.effective_chat.id) != settings.TELEGRAM_CHAT_ID:
         return
 
-    if not _pending_image_post_id:
+    # Read pending post ID from DB (not memory — restart-safe)
+    post_id = queries.get_pending_image_post()
+
+    if not post_id:
         await update.message.reply_text(
             "[ERROR] No post waiting for an image.\n"
-            "Send /generate_image first, then send the image."
+            "Send /generate_image first, then send the image here."
         )
         return
 
-    post_id = _pending_image_post_id
-
     try:
         import os, time
+
         photo = update.message.photo[-1]
         file = await context.bot.get_file(photo.file_id)
         save_path = f"/tmp/libero_img_{int(time.time())}.jpg"
         await file.download_to_drive(save_path)
+
+        logger.info("[handle_photo] Downloaded %s for post %s", save_path, post_id[:8])
 
         storage_path = f"posts/{post_id[:8]}_{int(time.time())}.jpg"
         public_url = None
@@ -412,7 +463,8 @@ async def handle_photo_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
             upload_url = f"{_settings.SUPABASE_URL}/storage/v1/object/post-images/{storage_path}"
             async with _httpx.AsyncClient(timeout=30) as _client:
                 upload_resp = await _client.post(
-                    upload_url, content=image_bytes,
+                    upload_url,
+                    content=image_bytes,
                     headers={
                         "Authorization": f"Bearer {_settings.SUPABASE_SERVICE_KEY}",
                         "Content-Type": "image/jpeg",
@@ -421,20 +473,25 @@ async def handle_photo_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 )
             if upload_resp.status_code in (200, 201):
                 public_url = f"{_settings.SUPABASE_URL}/storage/v1/object/public/post-images/{storage_path}"
+                logger.info("[handle_photo] Uploaded: %s", public_url)
             else:
                 raise Exception(f"Storage {upload_resp.status_code}: {upload_resp.text[:200]}")
+
         except Exception as storage_err:
-            logger.warning(f"[handle_photo] Storage upload failed: {storage_err}")
+            logger.warning("[handle_photo] Storage upload failed: %s", storage_err)
             public_url = f"telegram://user_upload/{os.path.basename(save_path)}"
 
-        queries.update_post_image(post_id=post_id, image_url=public_url, image_generator="user_upload")
+        # Save image URL — image_generator mapped to 'none' (valid enum value)
+        queries.update_post_image(post_id=post_id, image_url=public_url, image_generator="none")
+
+        # Clear the pending post ID from DB
+        queries.clear_pending_image_post()
 
         try:
             os.remove(save_path)
         except Exception:
             pass
 
-        _pending_image_post_id = None
         post = queries.get_post_by_id(post_id)
         status = post.get("status", "draft") if post else "draft"
         stored_ok = not public_url.startswith("telegram://")
@@ -443,7 +500,7 @@ async def handle_photo_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
             f"<b>[IMAGE SAVED]</b>\n\n"
             f"<code>POST ID    {post_id[:8].upper()}\n"
             f"STATUS     {status.upper()}\n"
-            f"STORAGE    {'SUPABASE OK' if stored_ok else 'LOCAL REF'}</code>\n\n"
+            f"STORAGE    {'SUPABASE OK' if stored_ok else 'LOCAL REF (upload failed)'}</code>\n\n"
             + (
                 "Post is approved — goes live at scheduled time with this image."
                 if status == "approved" else
@@ -453,11 +510,14 @@ async def handle_photo_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
 
     except Exception as e:
-        logger.error(f"[handle_photo] Failed: {e}", exc_info=True)
+        logger.error("[handle_photo] Failed: %s", e, exc_info=True)
         await update.message.reply_text(f"[ERROR] Failed to save image: {str(e)[:200]}\n\nTry again.")
 
 
+# ── Plain text handler — what's on my mind ────────────────────────────────────
+
 async def handle_mind_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Any non-command text is treated as a content signal (P1 priority)."""
     if str(update.effective_chat.id) != settings.TELEGRAM_CHAT_ID:
         return
     text = update.message.text.strip()
@@ -471,6 +531,8 @@ async def handle_mind_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         parse_mode="HTML",
     )
 
+
+# ── Command: /run_now ─────────────────────────────────────────────────────────
 
 async def handle_run_now(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if str(update.effective_chat.id) != settings.TELEGRAM_CHAT_ID:
@@ -487,6 +549,8 @@ async def handle_run_now(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     except Exception as e:
         await update.message.reply_text(f"[ERROR] Pipeline trigger failed: {e}")
 
+
+# ── Application factory ───────────────────────────────────────────────────────
 
 def build_telegram_app() -> Application:
     app = Application.builder().token(settings.TELEGRAM_BOT_TOKEN).build()
