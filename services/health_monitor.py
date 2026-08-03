@@ -1,25 +1,27 @@
 """
-services/health_monitor.py  (NEW — Phase 6)
+services/health_monitor.py  — Phase 6 (NEW FILE)
 
-Responsibilities:
-1. Session health check — called every 6 hours.
-   Pings LinkedIn API and checks CLAUDE_COOKIES / CHATGPT_COOKIES / GEMINI_COOKIES
-   presence. Sends Telegram alert if any platform is unhealthy.
+Called by scheduler.py's _async_session_health() stub (which currently just logs).
+This module contains the actual logic that stub should run.
 
-2. Crash loop detection — called on every startup.
-   Reads recent restart timestamps from Supabase. If 3+ restarts in 10 minutes,
-   sends a Telegram alert to Shiwang.
+Three responsibilities:
+  1. run_session_health_check()  — checks Anthropic API key + LinkedIn token validity.
+     Updates session_health table. Sends Telegram alert if anything is broken.
+     Called every 6 hours by APScheduler.
 
-3. Content pipeline failure recovery — called by scheduler after a failed generation.
-   Schedules a single retry after 30 minutes before alerting.
+  2. check_linkedin_token_age()  — warns at day 50 of the 60-day LinkedIn token.
+     Called once on startup from main.py (optional, low-noise).
 
-4. LinkedIn token age check — warns at day 50 of the 60-day token lifetime.
+  3. handle_generation_failure() — called by content_pipeline.py when generation fails.
+     Attempt 1: sends "retrying in 30 min" Telegram message.
+     Attempt 2: sends "action needed" alert. No further retries.
+     The 30-min retry is scheduled as a one-shot APScheduler job.
 """
 
 import logging
 import os
 from datetime import datetime, timedelta
-from typing import Optional
+
 import httpx
 import pytz
 
@@ -27,39 +29,123 @@ logger = logging.getLogger(__name__)
 IST = pytz.timezone("Asia/Kolkata")
 
 DASHBOARD_URL = "https://libero-content-manager-frontend.vercel.app"
-CRASH_LOOP_THRESHOLD = 3
-CRASH_LOOP_WINDOW_MINUTES = 10
-TOKEN_WARNING_DAY = 50  # Warn at day 50 of 60-day LinkedIn token
 
 
-async def _send_telegram(message: str, parse_mode: str = "HTML"):
+# ─── Telegram helper ──────────────────────────────────────────────────────────
+
+async def _send_telegram(text: str) -> None:
+    token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
+    if not token or not chat_id:
+        return
     try:
-        token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-        chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
-        if not token or not chat_id:
-            logger.warning("Telegram credentials not set — cannot send alert")
-            return
         async with httpx.AsyncClient(timeout=10) as client:
             await client.post(
                 f"https://api.telegram.org/bot{token}/sendMessage",
-                json={"chat_id": chat_id, "text": message, "parse_mode": parse_mode},
+                json={"chat_id": chat_id, "text": text, "parse_mode": "HTML"},
             )
     except Exception as e:
-        logger.error(f"_send_telegram error: {e}")
+        logger.error(f"[health_monitor] Telegram send failed: {e}")
 
 
-# ─────────────────────────────────────────────
-# 1. SESSION HEALTH CHECK
-# ─────────────────────────────────────────────
+# ─── 1. Session health check ──────────────────────────────────────────────────
 
-def _cookies_present(env_var: str) -> bool:
-    val = os.environ.get(env_var, "")
-    return bool(val and val.strip().startswith("["))
+async def run_session_health_check() -> dict:
+    """
+    Check Anthropic API key and LinkedIn token.
+    Updates session_health table for each platform.
+    Sends a single consolidated Telegram alert if anything is broken.
+    Returns {"healthy": bool, "issues": list[str]}
+    """
+    from db.queries import update_session_health
+
+    issues = []
+
+    # ── Anthropic API key ──────────────────────────────────────────────────
+    anthropic_ok = await _check_anthropic_key()
+    update_session_health(
+        platform="claude",
+        is_healthy=anthropic_ok,
+        last_error=None if anthropic_ok else "ANTHROPIC_API_KEY invalid or missing",
+    )
+    if not anthropic_ok:
+        issues.append(
+            "🔴 <b>Content generation broken</b>\n"
+            "ANTHROPIC_API_KEY is missing or rejected by Anthropic.\n"
+            "Posts will NOT be generated until this is fixed.\n"
+            "Fix: Railway → Variables → ANTHROPIC_API_KEY → re-paste fresh key."
+        )
+    else:
+        logger.info("[health_monitor] Anthropic API key: OK")
+
+    # ── LinkedIn token ─────────────────────────────────────────────────────
+    linkedin_ok = await _check_linkedin_token()
+    if not linkedin_ok:
+        issues.append(
+            "🔴 <b>LinkedIn token expired or invalid</b>\n"
+            "Posts will NOT go out until you renew the token (60-day limit).\n"
+            "Renew: follow Section 8 of the master doc (10 minutes).\n"
+            f"Dashboard: {DASHBOARD_URL}/settings"
+        )
+    else:
+        logger.info("[health_monitor] LinkedIn token: OK")
+
+    # ── ChatGPT cookies (presence check only — Playwright blocked) ─────────
+    chatgpt_present = bool(os.environ.get("CHATGPT_COOKIES", "").strip().startswith("["))
+    update_session_health(
+        platform="chatgpt",
+        is_healthy=chatgpt_present,
+        last_error=None if chatgpt_present else "CHATGPT_COOKIES not set",
+    )
+    # Note: not sending alert for missing ChatGPT cookies —
+    # image flow is prompt-based (user generates externally), so this is non-critical.
+
+    gemini_present = bool(os.environ.get("GEMINI_COOKIES", "").strip().startswith("["))
+    update_session_health(
+        platform="gemini",
+        is_healthy=gemini_present,
+        last_error=None if gemini_present else "GEMINI_COOKIES not set",
+    )
+
+    # ── Send consolidated alert if anything critical is broken ─────────────
+    if issues:
+        now_ist = datetime.now(IST).strftime("%Y-%m-%d %H:%M IST")
+        header = f"🔔 <b>Libero Health Alert</b> — {now_ist}\n\n"
+        await _send_telegram(header + "\n\n".join(issues))
+        logger.warning(f"[health_monitor] Health check found {len(issues)} issue(s)")
+    else:
+        logger.info("[health_monitor] All critical checks passed ✓")
+
+    return {"healthy": len(issues) == 0, "issues": issues}
+
+
+async def _check_anthropic_key() -> bool:
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+    if not api_key:
+        return False
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={
+                    "x-api-key": api_key,
+                    "anthropic-version": "2023-06-01",
+                    "content-type": "application/json",
+                },
+                json={
+                    "model": "claude-sonnet-4-5",
+                    "max_tokens": 10,
+                    "messages": [{"role": "user", "content": "ping"}],
+                },
+            )
+            return resp.status_code == 200
+    except Exception as e:
+        logger.error(f"[health_monitor] Anthropic key check failed: {e}")
+        return False
 
 
 async def _check_linkedin_token() -> bool:
-    """Returns True if LinkedIn token is valid."""
-    token = os.environ.get("LINKEDIN_ACCESS_TOKEN", "")
+    token = os.environ.get("LINKEDIN_ACCESS_TOKEN", "").strip()
     if not token:
         return False
     try:
@@ -70,232 +156,118 @@ async def _check_linkedin_token() -> bool:
             )
             return resp.status_code == 200
     except Exception as e:
-        logger.error(f"LinkedIn token check error: {e}")
+        logger.error(f"[health_monitor] LinkedIn token check failed: {e}")
         return False
 
 
-async def run_session_health_check():
+# ─── 2. LinkedIn token age warning ───────────────────────────────────────────
+
+async def check_linkedin_token_age() -> None:
     """
-    Check health of all platforms. Called every 6 hours.
-    Updates session_health table. Sends Telegram alerts for failures.
+    Warn if LinkedIn token is 50+ days old (expires at 60).
+    Reads LINKEDIN_TOKEN_ISSUED_DATE env var (format: YYYY-MM-DD).
+    If the var isn't set, silently skips — no noise on existing deployments.
     """
-    from db.queries import update_session_health, get_session_health
-
-    alerts = []
-
-    # ── Claude (Anthropic API key presence)
-    # P2 deviation: we use Anthropic API, not Playwright. Check API key.
-    anthropic_key = os.environ.get("ANTHROPIC_API_KEY", "")
-    claude_healthy = bool(anthropic_key and anthropic_key.startswith("sk-ant"))
-    update_session_health(
-        "claude",
-        claude_healthy,
-        "" if claude_healthy else "ANTHROPIC_API_KEY missing or malformed",
-    )
-    if not claude_healthy:
-        alerts.append(
-            "🔴 <b>Content generation unhealthy</b>\n"
-            "ANTHROPIC_API_KEY is missing or invalid in Railway Variables.\n"
-            "Posts will NOT be generated until fixed."
-        )
-
-    # ── ChatGPT cookies (image prompt flow — kept for future use)
-    chatgpt_ok = _cookies_present("CHATGPT_COOKIES")
-    update_session_health(
-        "chatgpt",
-        chatgpt_ok,
-        "" if chatgpt_ok else "CHATGPT_COOKIES not set or malformed",
-    )
-    if not chatgpt_ok:
-        alerts.append(
-            "⚠️ <b>ChatGPT cookies not configured</b>\n"
-            "CHATGPT_COOKIES is not set. Image prompt generation may be affected."
-        )
-
-    # ── Gemini cookies
-    gemini_ok = _cookies_present("GEMINI_COOKIES")
-    update_session_health(
-        "gemini",
-        gemini_ok,
-        "" if gemini_ok else "GEMINI_COOKIES not set or malformed",
-    )
-    if not gemini_ok:
-        alerts.append(
-            "⚠️ <b>Gemini cookies not configured</b>\n"
-            "GEMINI_COOKIES is not set. Image prompt generation may be affected."
-        )
-
-    # ── LinkedIn token
-    linkedin_ok = await _check_linkedin_token()
-    if not linkedin_ok:
-        alerts.append(
-            "🔴 <b>LinkedIn token invalid or expired!</b>\n\n"
-            "Posts will NOT go out until you renew the token.\n"
-            f"Renewal guide: {DASHBOARD_URL}/settings\n\n"
-            "See master doc Section 8 for renewal steps."
-        )
-
-    # Send consolidated alert if anything is wrong
-    if alerts:
-        header = "🔔 <b>Libero Health Check — Issues Found</b>\n\n"
-        full_message = header + "\n\n".join(alerts)
-        await _send_telegram(full_message)
-        logger.warning(f"Health check found {len(alerts)} issue(s)")
-    else:
-        logger.info("Health check: all platforms healthy ✓")
-
-    return {"healthy": len(alerts) == 0, "issues": len(alerts)}
-
-
-# ─────────────────────────────────────────────
-# 2. CRASH LOOP DETECTION
-# ─────────────────────────────────────────────
-
-async def on_startup_check():
-    """
-    Called on every Railway startup in main.py.
-    Logs the restart. Checks for crash loop.
-    Sends alert if 3+ restarts in 10 minutes.
-    Also checks LinkedIn token age.
-    """
-    from db.queries import log_system_restart, get_recent_restart_count
-
-    # Log this restart
-    log_system_restart()
-
-    # Count recent restarts
-    recent_count = get_recent_restart_count(minutes=CRASH_LOOP_WINDOW_MINUTES)
-
-    if recent_count >= CRASH_LOOP_THRESHOLD:
-        message = (
-            f"🚨 <b>Crash loop detected!</b>\n\n"
-            f"Backend restarted <b>{recent_count} times</b> in the last {CRASH_LOOP_WINDOW_MINUTES} minutes.\n\n"
-            f"This likely indicates a fatal error on startup.\n\n"
-            f"<b>Action needed:</b>\n"
-            f"1. Open Railway dashboard → Logs tab\n"
-            f"2. Look for Python tracebacks or import errors\n"
-            f"3. Fix the error and push to GitHub\n\n"
-            f"System may be in a degraded state. Posts will not go out until fixed."
-        )
-        await _send_telegram(message)
-        logger.critical(f"CRASH LOOP: {recent_count} restarts in {CRASH_LOOP_WINDOW_MINUTES} minutes")
-    else:
-        logger.info(f"Startup health check: {recent_count} recent restart(s) — normal")
-
-    # Check LinkedIn token age
-    await _check_linkedin_token_age()
-
-
-async def _check_linkedin_token_age():
-    """
-    Warn at day 50 of the 60-day LinkedIn token lifetime.
-    We can't query the token creation date directly, so we store it in
-    an environment variable LINKEDIN_TOKEN_ISSUED_DATE (set by /auth/linkedin/callback).
-    """
-    issued_date_str = os.environ.get("LINKEDIN_TOKEN_ISSUED_DATE", "")
-    if not issued_date_str:
-        return  # Don't have the date, can't check
+    issued_str = os.environ.get("LINKEDIN_TOKEN_ISSUED_DATE", "").strip()
+    if not issued_str:
+        return  # var not set — skip silently
 
     try:
-        issued_date = datetime.strptime(issued_date_str, "%Y-%m-%d")
-        days_old = (datetime.now() - issued_date).days
+        issued = datetime.strptime(issued_str, "%Y-%m-%d")
+        days_old = (datetime.now() - issued).days
+        days_left = 60 - days_old
 
-        if days_old >= TOKEN_WARNING_DAY:
-            days_remaining = 60 - days_old
-            if days_remaining <= 0:
-                msg = (
-                    "🔴 <b>LinkedIn token has expired!</b>\n\n"
-                    f"Issued {days_old} days ago (limit: 60 days).\n"
-                    f"Renew immediately — no posts will go out until renewed.\n\n"
-                    f"See master doc Section 8 for renewal steps."
-                )
-            else:
-                msg = (
-                    f"⚠️ <b>LinkedIn token expires in {days_remaining} days</b>\n\n"
-                    f"Issued {days_old} days ago. Token expires after 60 days.\n"
-                    f"Renew soon to avoid interruption.\n\n"
-                    f"See master doc Section 8 for renewal steps."
-                )
-            await _send_telegram(msg)
+        if days_left <= 0:
+            await _send_telegram(
+                "🔴 <b>LinkedIn token has expired!</b>\n\n"
+                f"Token issued {days_old} days ago (60-day limit reached).\n"
+                "No posts will go out until you renew it.\n\n"
+                "Renew: follow Section 8 of the master doc.\n"
+                "Takes ~10 minutes."
+            )
+        elif days_old >= 50:
+            await _send_telegram(
+                f"⚠️ <b>LinkedIn token expires in {days_left} days</b>\n\n"
+                f"Issued {days_old} days ago. Expires after 60 days.\n"
+                "Renew soon to avoid a gap in posting.\n\n"
+                "Renew: follow Section 8 of the master doc."
+            )
+        else:
+            logger.info(f"[health_monitor] LinkedIn token age: {days_old}d old, {days_left}d remaining")
+
     except Exception as e:
-        logger.error(f"_check_linkedin_token_age error: {e}")
+        logger.error(f"[health_monitor] Token age check error: {e}")
 
 
-# ─────────────────────────────────────────────
-# 3. CONTENT PIPELINE FAILURE RECOVERY
-# ─────────────────────────────────────────────
+# ─── 3. Content generation failure recovery ───────────────────────────────────
 
-# In-memory retry tracker (resets on restart, which is fine — scheduler re-tries anyway)
-_generation_retry_tracker: dict = {}  # scheduled_time_str → attempt_count
-
-
-async def handle_generation_failure(scheduled_time: str, attempt: int = 1):
+async def handle_generation_failure(scheduled_time: str, attempt: int = 1) -> None:
     """
-    Called when content generation fails.
-    - Attempt 1 → schedules retry in 30 minutes (via scheduler's one-shot job)
-    - Attempt 2 → sends Telegram alert, no further retry
+    Called from content_pipeline.py's except block when generation fails.
+
+    attempt=1: sends "retrying in 30 min" alert.
+               Schedules a one-shot retry job via APScheduler.
+    attempt=2: sends "action needed" alert. No further automated retry.
+
+    The retry is a one-shot APScheduler DateTrigger job that re-runs
+    run_content_pipeline() directly.
     """
     if attempt == 1:
-        logger.warning(f"Content generation failed for {scheduled_time} — scheduling retry in 30min")
+        logger.warning(f"[health_monitor] Generation failed for {scheduled_time} — scheduling retry in 30 min")
         await _send_telegram(
             f"⚠️ <b>Content generation failed (attempt 1/2)</b>\n\n"
-            f"Scheduled for: {scheduled_time} IST\n"
-            f"Retrying in 30 minutes automatically..."
+            f"Scheduled slot: {scheduled_time} IST\n\n"
+            f"Retrying automatically in 30 minutes..."
         )
-        _generation_retry_tracker[scheduled_time] = 1
-        # The scheduler calls this function again 30 minutes later with attempt=2
-        # That scheduling is done in scheduler.py
+        _schedule_generation_retry(scheduled_time)
+
     else:
-        logger.error(f"Content generation failed again for {scheduled_time} — alerting Shiwang")
+        logger.error(f"[health_monitor] Generation failed again for {scheduled_time} — alerting")
         await _send_telegram(
             f"🔴 <b>Content generation failed (attempt 2/2)</b>\n\n"
-            f"Scheduled for: {scheduled_time} IST\n\n"
-            f"<b>Action needed:</b>\n"
-            f"1. Check Railway logs for error details\n"
-            f"2. Or manually create a post via the Input view:\n"
-            f"   {DASHBOARD_URL}\n\n"
-            f"Alternatively, send your post text as a message to this bot and use /approve."
+            f"Scheduled slot: {scheduled_time} IST\n\n"
+            f"<b>Action needed — choose one:</b>\n"
+            f"• Type your post idea here and I'll save it as a content signal\n"
+            f"• Open the Input view on the dashboard and paste your draft\n"
+            f"• Check Railway logs for the error and fix it\n\n"
+            f"Dashboard: {DASHBOARD_URL}"
         )
-        _generation_retry_tracker.pop(scheduled_time, None)
 
 
-def get_generation_retry_count(scheduled_time: str) -> int:
-    return _generation_retry_tracker.get(scheduled_time, 0)
+def _schedule_generation_retry(scheduled_time: str) -> None:
+    """Add a one-shot APScheduler job to retry content generation in 30 minutes."""
+    try:
+        from apscheduler.triggers.date import DateTrigger
+        from scheduler import scheduler
 
+        retry_at = datetime.now(IST) + timedelta(minutes=30)
 
-# ─────────────────────────────────────────────
-# 4. WEEKLY METRICS FETCH
-# ─────────────────────────────────────────────
+        def _retry_job():
+            import asyncio
+            from services.content_pipeline import run_content_pipeline
+            logger.info(f"[health_monitor] Running generation retry for slot {scheduled_time}")
 
-async def fetch_and_store_linkedin_metrics():
-    """
-    Called weekly by the scheduler.
-    Fetches engagement metrics for recent posted posts and stores in posted_metrics table.
-    """
-    from db.queries import get_posts_needing_metrics, save_post_metrics
-    from services.linkedin_poster import fetch_linkedin_metrics
+            async def _run():
+                try:
+                    result = await run_content_pipeline()
+                    if not result["success"]:
+                        # Second failure — notify but don't retry again
+                        import asyncio as _asyncio
+                        _asyncio.run(handle_generation_failure(scheduled_time, attempt=2))
+                except Exception as e:
+                    logger.error(f"[health_monitor] Retry job crashed: {e}")
+                    import asyncio as _asyncio
+                    _asyncio.run(handle_generation_failure(scheduled_time, attempt=2))
 
-    posts = get_posts_needing_metrics(days_ago=30)
-    if not posts:
-        logger.info("Metrics fetch: no posts to update")
-        return
+            asyncio.run(_run())
 
-    updated = 0
-    for post in posts:
-        linkedin_post_id = post.get("linkedin_post_id")
-        if not linkedin_post_id or linkedin_post_id.startswith("unknown_"):
-            continue
-        metrics = await fetch_linkedin_metrics(linkedin_post_id)
-        if metrics:
-            save_post_metrics(
-                post_id=post["id"],
-                impressions=metrics.get("impressions", 0),
-                likes=metrics.get("likes", 0),
-                comments=metrics.get("comments", 0),
-                shares=metrics.get("shares", 0),
-                clicks=metrics.get("clicks", 0),
-            )
-            updated += 1
+        scheduler.add_job(
+            _retry_job,
+            trigger=DateTrigger(run_date=retry_at, timezone=IST),
+            id=f"gen_retry_{scheduled_time.replace(' ', '_').replace(':', '')}",
+            replace_existing=True,
+        )
+        logger.info(f"[health_monitor] Retry job scheduled for {retry_at.strftime('%H:%M IST')}")
 
-    logger.info(f"Metrics fetch: updated {updated}/{len(posts)} posts")
-    return updated
+    except Exception as e:
+        logger.error(f"[health_monitor] Failed to schedule retry job: {e}")
