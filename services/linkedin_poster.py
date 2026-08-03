@@ -4,11 +4,14 @@ Implements the full image upload + asset availability retry loop + UGC post crea
 This is the only place that touches LinkedIn API. Called by scheduler.py at posting time.
 """
 import asyncio
+import logging
 import httpx
 from datetime import datetime
 import pytz
 from config import settings
 from db import queries
+
+logger = logging.getLogger(__name__)
 
 LINKEDIN_API = "https://api.linkedin.com/v2"
 
@@ -46,13 +49,38 @@ async def post_to_linkedin(post_id: str) -> dict:
             "Post saved as failed — retry from dashboard after renewing."
         )
 
+    posted_with_image = False
     try:
         async with httpx.AsyncClient(timeout=60) as client:
             if image_url:
-                asset_urn = await _upload_image(client, headers, person_urn, image_url)
-                linkedin_post_id = await _create_ugc_post_with_image(client, headers, person_urn, content, asset_urn)
+                try:
+                    asset_urn = await _upload_image(client, headers, person_urn, image_url)
+                    linkedin_post_id = await _create_ugc_post_with_image(
+                        client, headers, person_urn, content, asset_urn
+                    )
+                    posted_with_image = True
+                except TimeoutError as te:
+                    # Image asset never became AVAILABLE — fall back to text only
+                    logger.warning(
+                        "[linkedin_poster] Image availability timeout — posting text-only: %s", te
+                    )
+                    await _alert_image_fallback(str(te))
+                    linkedin_post_id = await _create_ugc_post_text_only(
+                        client, headers, person_urn, content
+                    )
+                except (httpx.HTTPStatusError, httpx.RequestError) as img_err:
+                    # Image download or upload failed — fall back to text only
+                    logger.warning(
+                        "[linkedin_poster] Image upload failed — posting text-only: %s", img_err
+                    )
+                    await _alert_image_fallback(str(img_err))
+                    linkedin_post_id = await _create_ugc_post_text_only(
+                        client, headers, person_urn, content
+                    )
             else:
-                linkedin_post_id = await _create_ugc_post_text_only(client, headers, person_urn, content)
+                linkedin_post_id = await _create_ugc_post_text_only(
+                    client, headers, person_urn, content
+                )
     except httpx.HTTPStatusError as e:
         if e.response.status_code == 401:
             await _alert_token_expired()
@@ -66,7 +94,37 @@ async def post_to_linkedin(post_id: str) -> dict:
     posted_time = datetime.now(ist).isoformat()
     queries.mark_post_posted(post_id, linkedin_post_id, posted_time)
 
-    return {"success": True, "linkedin_post_id": linkedin_post_id}
+    return {
+        "success": True,
+        "linkedin_post_id": linkedin_post_id,
+        "posted_with_image": posted_with_image,
+    }
+
+
+async def _alert_image_fallback(reason: str) -> None:
+    """
+    Notify Shiwang that the image failed and the post went out as text-only.
+    Post still goes live — this is informational only.
+    """
+    import os
+    bot_token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
+    if not bot_token or not chat_id:
+        return
+    message = (
+        f"<b>[IMAGE FAILED — TEXT ONLY]</b>\n\n"
+        f"<code>REASON  {reason[:150]}</code>\n\n"
+        f"Post went live as text-only. "
+        f"The image was not attached. Check Supabase Storage if the URL was set."
+    )
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            await client.post(
+                f"https://api.telegram.org/bot{bot_token}/sendMessage",
+                json={"chat_id": chat_id, "text": message, "parse_mode": "HTML"},
+            )
+    except Exception as e:
+        logger.error("[linkedin_poster] Image fallback alert failed: %s", e)
 
 
 async def _check_token(headers: dict) -> bool:
