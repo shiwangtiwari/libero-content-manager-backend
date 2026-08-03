@@ -208,7 +208,6 @@ def update_session_health(platform: str, is_healthy: bool,
         payload["last_success"] = now
         payload["failure_count"] = 0
     else:
-        # Increment failure count
         current = db.table("session_health").select("failure_count").eq("platform", platform).single().execute()
         current_count = (current.data.get("failure_count") or 0) if current.data else 0
         payload["failure_count"] = current_count + 1
@@ -224,3 +223,52 @@ def upsert_post_metrics(post_id: str, metrics: dict) -> None:
         "post_id": post_id,
         **metrics,
     }).execute()
+
+
+# ── User profile ─────────────────────────────────────────────────────────────
+
+def get_user_profile() -> Optional[dict]:
+    """
+    Returns the single user profile row, or None if not yet created.
+    The profile is stored as a list of bubble dicts: [{id, label, content, order}]
+    """
+    db = get_supabase()
+    try:
+        result = db.table("user_profile").select("*").eq("id", "shiwang").execute()
+        return result.data[0] if result.data else None
+    except Exception:
+        return None
+
+
+def upsert_user_profile(bubbles: list[dict]) -> dict:
+    """
+    Save the full bubble list for the profile.
+    bubbles: [{id: str, label: str, content: str, order: int}]
+    Uses upsert so first save creates the row, subsequent saves update it.
+    """
+    db = get_supabase()
+    result = db.table("user_profile").upsert({
+        "id": "shiwang",
+        "bubbles": bubbles,
+    }).execute()
+    return result.data[0] if result.data else {}
+
+
+def get_profile_as_context() -> str:
+    """
+    Returns the profile as a formatted string for injection into the content
+    generation prompt. Returns empty string if no profile exists.
+    """
+    profile = get_user_profile()
+    if not profile:
+        return ""
+    bubbles = profile.get("bubbles", [])
+    if not bubbles:
+        return ""
+    lines = ["ABOUT SHIWANG (use this to match his voice and worldview):"]
+    for b in sorted(bubbles, key=lambda x: x.get("order", 0)):
+        label = b.get("label", "")
+        content = b.get("content", "")
+        if label and content:
+            lines.append(f"  {label}: {content}")
+    return "\n".join(lines)
