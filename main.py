@@ -21,7 +21,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from config import settings
 from scheduler import start_scheduler
-from routers import health, posts, linkedin, inputs
+from routers import health, posts, linkedin, inputs, profile
 
 logging.basicConfig(
     level=logging.INFO,
@@ -119,6 +119,7 @@ app.include_router(health.router)
 app.include_router(posts.router)
 app.include_router(linkedin.router)
 app.include_router(inputs.router)
+app.include_router(profile.router)
 from routers import internal
 app.include_router(internal.router)
 
