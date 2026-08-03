@@ -89,18 +89,19 @@ async def _run_posting_job(slot_label: str):
             result = await post_to_linkedin(post["id"])
             post_url = f"https://www.linkedin.com/feed/update/{result['linkedin_post_id']}"
             await send_telegram_message(
-                f"✅ Your LinkedIn post is live!\n"
-                f"Slot: {slot_label}\n"
-                f"View: {post_url}"
+                f"<b>[POSTED]</b>\n\n"
+                f"<code>SLOT       {slot_label}</code>\n\n"
+                f"View: {post_url}",
             )
             logger.info(f"[Scheduler] Posted successfully: {result['linkedin_post_id']}")
         except Exception as e:
             logger.error(f"[Scheduler] Posting failed for post {post['id']}: {e}")
             queries.update_post_status(post["id"], "failed")
             await send_telegram_message(
-                f"❌ LinkedIn posting failed for {slot_label} slot.\n"
-                f"Error: {str(e)[:200]}\n"
-                f"Post saved as draft. Retry from dashboard."
+                f"<b>[POST FAILED]</b>\n\n"
+                f"<code>SLOT   {slot_label}\n"
+                f"ERROR  {str(e)[:150]}</code>\n\n"
+                f"Post saved. Retry from dashboard.",
             )
 
 
@@ -113,15 +114,15 @@ async def _async_check_missed_approvals():
     for action in actions:
         if action.get("expired"):
             await send_telegram_message(
-                f"⚠️ Post expired after 3 reschedules.\n"
-                f"ID: {action['post_id'][:8]}\n"
-                f"Send /approve to post now or /reject to discard."
+                f"<b>[EXPIRED]</b>\n\n"
+                f"<code>ID         {action['post_id'][:8].upper()}</code>\n\n"
+                f"/approve to post now   /reject to discard",
             )
         elif action.get("ok") and not action.get("expired"):
             await send_telegram_message(
-                f"⏰ Post not approved in time. Auto-rescheduled.\n"
-                f"New time: {action.get('new_time')} IST\n"
-                f"Reschedule count: {action.get('post', {}).get('reschedule_count', '?')}/3"
+                f"<b>[RESCHEDULED]</b>\n\n"
+                f"<code>NEW SLOT   {action.get('new_time')} IST\n"
+                f"COUNT      {action.get('post', {}).get('reschedule_count', '?')}/3</code>",
             )
 
 
