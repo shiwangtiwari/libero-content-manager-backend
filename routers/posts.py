@@ -130,11 +130,23 @@ async def reschedule_post_patch(post_id: str, body: UpdateScheduleRequest):
 
 @router.post("/{post_id}/approve")
 async def approve_post_post(post_id: str):
-    """POST alias for approve (frontend sends POST)."""
+    """POST alias for approve (frontend sends POST). Notifies Telegram."""
     post = queries.get_post_by_id(post_id)
     if not post:
         raise HTTPException(status_code=404, detail="Post not found")
     updated = queries.update_post_status(post_id, "approved")
+    # Notify Telegram — dashboard action
+    try:
+        import asyncio
+        from routers.telegram import send_telegram_message
+        asyncio.create_task(send_telegram_message(
+            f"<b>[CONFIRMED / DASHBOARD]</b>\n\n"
+            f"<code>STATUS     APPROVED\n"
+            f"SLOT       {post.get('scheduled_time', 'TBD')} IST\n"
+            f"ID         {post_id[:8].upper()}</code>",
+        ))
+    except Exception:
+        pass
     return updated
 
 
@@ -168,6 +180,19 @@ async def reject_post_post(post_id: str):
             import logging
             logging.getLogger(__name__).warning("Post-reject regen failed: %s", e)
 
+    # Notify Telegram — dashboard action
+    try:
+        import asyncio
+        from routers.telegram import send_telegram_message
+        regen_msg = " Regenerating..." if rejected_slot else ""
+        asyncio.create_task(send_telegram_message(
+            f"<b>[REJECTED / DASHBOARD]</b>\n\n"
+            f"<code>ID         {post_id[:8].upper()}\n"
+            f"SLOT       {rejected_slot or 'n/a'}</code>"
+            + (f"\n\nNew draft arriving in ~30 seconds." if rejected_slot else ""),
+        ))
+    except Exception:
+        pass
     return updated
 
 
@@ -200,4 +225,16 @@ async def edit_post_content(post_id: str, body: EditContentRequest):
         )
 
     updated = queries.update_post_content(post_id, cleaned)
+    # Notify Telegram — dashboard edit
+    try:
+        import asyncio
+        from routers.telegram import send_telegram_message
+        asyncio.create_task(send_telegram_message(
+            f"<b>[UPDATED / DASHBOARD]</b>\n\n"
+            f"<code>ID         {post_id[:8].upper()}\n"
+            f"LENGTH     {len(cleaned)} chars\n"
+            f"STATUS     {post['status'].upper()}</code>",
+        ))
+    except Exception:
+        pass
     return {"ok": True, "post": updated, "char_count": len(cleaned)}
