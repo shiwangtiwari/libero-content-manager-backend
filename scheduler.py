@@ -2,19 +2,20 @@
 APScheduler setup. All times in IST (Asia/Kolkata). No UTC conversion.
 
 Uses BackgroundScheduler (runs in its own thread) instead of AsyncIOScheduler.
-Reason: AsyncIOScheduler requires being started inside an active asyncio event
-loop. FastAPI + uvicorn creates its own loop and the timing of startup causes
-the scheduler to start but not persist. BackgroundScheduler has no such
-dependency and works reliably with FastAPI.
-
-All async job functions are wrapped with asyncio.run() so BackgroundScheduler
-can call them from its thread.
+All async job functions are wrapped with asyncio.run().
 
 Jobs:
   - Post publishing: Tue 8:30, Wed 12:00, Thu 9:00 IST
   - Missed approval check: every 5 minutes
-  - Session health check: every 6 hours (Phase 6)
-  - Content generation: Mon 6 AM, Tue 6 AM, Wed 6 AM IST (Phase 3)
+  - Session health check: every 6 hours
+  - Content generation: Mon 6 AM, Tue 6 AM, Wed 6 AM IST
+  - Weekly LinkedIn metrics: Mon 9 AM IST
+
+Phase 6 hardening:
+  - Duplicate post guard: claim_post_for_posting() atomically flips status
+    approved→failed before touching LinkedIn API. Only one job can claim a post.
+    Second job finds status='failed' and skips. On LinkedIn success → 'posted'.
+    On LinkedIn failure → reverts to 'approved' so dashboard retry works.
 """
 import asyncio
 import logging
@@ -30,8 +31,7 @@ scheduler = BackgroundScheduler(timezone=IST)
 
 
 # ---------------------------------------------------------------------------
-# Sync wrappers — BackgroundScheduler calls these from a thread.
-# Each one creates a fresh event loop to run the async function.
+# Sync wrappers
 # ---------------------------------------------------------------------------
 
 def job_post_tuesday():
@@ -71,37 +71,67 @@ async def _async_post_thursday():
 
 
 async def _run_posting_job(slot_label: str):
-    """Find the approved post for this slot and publish it."""
+    """
+    Find the approved post for this slot and publish it to LinkedIn.
+
+    Duplicate post guard (Phase 6):
+    1. Fetch all approved posts due now.
+    2. For each post, call claim_post_for_posting() which atomically flips
+       status approved→failed. This is the "lock".
+    3. If claim returns False, the post was already claimed by another job — skip.
+    4. If claim returns True, we own this post. Call LinkedIn API.
+    5. On success: mark_post_posted() → status='posted'.
+    6. On failure: revert_post_to_approved() → status='approved' again.
+       This lets Shiwang retry from the dashboard.
+    """
     from db import queries
     from services.linkedin_poster import post_to_linkedin
     from routers.telegram import send_telegram_message
 
     now_ist = datetime.now(IST).strftime("%Y-%m-%d %H:%M")
-    logger.info(f"[Scheduler] Posting job triggered for slot: {slot_label} — {now_ist}")
+    logger.info("[Scheduler] Posting job: %s — %s", slot_label, now_ist)
 
     due_posts = queries.get_approved_posts_due_now(now_ist)
     if not due_posts:
-        logger.info("[Scheduler] No approved posts due for this slot.")
+        logger.info("[Scheduler] No approved posts due for slot: %s", slot_label)
         return
 
     for post in due_posts:
+        post_id = post["id"]
+
+        # ── Duplicate guard: atomic claim ──────────────────────────────────
+        claimed = queries.claim_post_for_posting(post_id)
+        if not claimed:
+            logger.warning(
+                "[Scheduler] Post %s already claimed by another job — skipping (duplicate guard)",
+                post_id[:8],
+            )
+            continue
+
+        logger.info("[Scheduler] Claimed post %s — posting to LinkedIn", post_id[:8])
+
         try:
-            result = await post_to_linkedin(post["id"])
+            result = await post_to_linkedin(post_id)
+            # Success — mark as posted (mark_post_posted sets status='posted')
             post_url = f"https://www.linkedin.com/feed/update/{result['linkedin_post_id']}"
             await send_telegram_message(
                 f"<b>[POSTED]</b>\n\n"
-                f"<code>SLOT       {slot_label}</code>\n\n"
+                f"<code>SLOT       {slot_label}\n"
+                f"LI ID      {result['linkedin_post_id'][:20]}</code>\n\n"
                 f"View: {post_url}",
             )
-            logger.info(f"[Scheduler] Posted successfully: {result['linkedin_post_id']}")
+            logger.info("[Scheduler] Posted successfully: %s", result["linkedin_post_id"])
+
         except Exception as e:
-            logger.error(f"[Scheduler] Posting failed for post {post['id']}: {e}")
-            queries.update_post_status(post["id"], "failed")
+            # Failure — revert status to 'approved' so dashboard retry works
+            logger.error("[Scheduler] Posting failed for post %s: %s", post_id[:8], e)
+            queries.revert_post_to_approved(post_id)
             await send_telegram_message(
                 f"<b>[POST FAILED]</b>\n\n"
-                f"<code>SLOT   {slot_label}\n"
-                f"ERROR  {str(e)[:150]}</code>\n\n"
-                f"Post saved. Retry from dashboard.",
+                f"<code>SLOT       {slot_label}\n"
+                f"ID         {post_id[:8].upper()}\n"
+                f"ERROR      {str(e)[:150]}</code>\n\n"
+                f"Post reverted to APPROVED. Retry from dashboard or send /approve.",
             )
 
 
@@ -115,29 +145,33 @@ async def _async_check_missed_approvals():
         if action.get("expired"):
             await send_telegram_message(
                 f"<b>[EXPIRED]</b>\n\n"
-                f"<code>ID         {action['post_id'][:8].upper()}</code>\n\n"
-                f"/approve to post now   /reject to discard",
+                f"<code>ID         {action['post_id'][:8].upper()}\n"
+                f"PREVIEW    {action.get('content_preview', '')[:60]}</code>\n\n"
+                f"/approve to post it now\n"
+                f"/reject  to discard it"
             )
-        elif action.get("ok") and not action.get("expired"):
+        elif action.get("action") == "rescheduled":
+            count = action.get("reschedule_count", "?")
             await send_telegram_message(
                 f"<b>[RESCHEDULED]</b>\n\n"
-                f"<code>NEW SLOT   {action.get('new_time')} IST\n"
-                f"COUNT      {action.get('post', {}).get('reschedule_count', '?')}/3</code>",
+                f"<code>NEW SLOT   {action.get('new_slot')} IST\n"
+                f"COUNT      {count}/3\n"
+                f"PREVIEW    {action.get('content_preview', '')[:60]}</code>"
             )
 
 
 async def _async_session_health():
-    """Every 6 hours: session health check (Phase 6)."""
+    """Every 6 hours: session health check."""
     logger.info("[Scheduler] Session health check running...")
     try:
         from services.health_monitor import run_session_health_check
         result = await run_session_health_check()
         logger.info(
-            "[Scheduler] Session health check done — healthy=%s, issues=%d",
+            "[Scheduler] Health check done — healthy=%s, issues=%d",
             result["healthy"], len(result["issues"]),
         )
     except Exception as e:
-        logger.error(f"[Scheduler] Session health check crashed: {e}")
+        logger.error("[Scheduler] Session health check crashed: %s", e)
 
 
 async def _async_generate_content():
@@ -146,34 +180,32 @@ async def _async_generate_content():
     try:
         from services.content_pipeline import run_content_pipeline
         result = await run_content_pipeline()
-        if result["success"]:
+        if result["success"] and not result.get("skipped"):
             logger.info(
                 "[Scheduler] Content pipeline succeeded: post_id=%s topic='%s'",
                 result.get("post_id"), result.get("topic", "")[:50],
             )
+        elif result.get("skipped"):
+            logger.info("[Scheduler] Content pipeline skipped — slot already has a draft")
         else:
             logger.error("[Scheduler] Content pipeline failed: %s", result.get("error"))
     except Exception as e:
-        logger.error(f"[Scheduler] Content generation job exception: {e}", exc_info=True)
+        logger.error("[Scheduler] Content generation crashed: %s", e, exc_info=True)
         try:
             from routers.telegram import send_telegram_message
             await send_telegram_message(
-                f"❌ <b>Content generation job crashed</b>\n\n"
-                f"<b>Error:</b> {str(e)[:300]}\n\n"
-                f"Check Railway logs."
+                f"<b>[GENERATION FAILED]</b>\n\n"
+                f"<code>ERROR  {str(e)[:250]}</code>\n\n"
+                f"Check Railway logs. Send /run_now to retry."
             )
         except Exception:
             pass
 
 
 async def _async_fetch_metrics():
-    """
-    Weekly: fetch LinkedIn engagement metrics for recent posted posts.
-    Stores results in posted_metrics table so the Posted view can show them.
-    """
+    """Weekly Monday 9 AM: fetch LinkedIn engagement metrics for recent posts."""
     logger.info("[Scheduler] Weekly metrics fetch running...")
     try:
-        from db.queries import get_all_session_health
         from db.supabase_client import get_supabase
         from config import settings
         import httpx
@@ -186,7 +218,6 @@ async def _async_fetch_metrics():
             logger.warning("[Scheduler] Metrics fetch skipped — no LINKEDIN_ACCESS_TOKEN")
             return
 
-        # Get posts from last 30 days with a linkedin_post_id
         db = get_supabase()
         cutoff = (datetime.now(ist) - timedelta(days=30)).isoformat()
         result = (
@@ -198,9 +229,8 @@ async def _async_fetch_metrics():
             .execute()
         )
         posts = result.data or []
-
         if not posts:
-            logger.info("[Scheduler] Metrics fetch: no eligible posts found")
+            logger.info("[Scheduler] Metrics fetch: no eligible posts")
             return
 
         updated = 0
@@ -208,7 +238,6 @@ async def _async_fetch_metrics():
             "Authorization": f"Bearer {token}",
             "X-Restli-Protocol-Version": "2.0.0",
         }
-
         async with httpx.AsyncClient(timeout=15) as client:
             for post in posts:
                 li_id = post.get("linkedin_post_id", "")
@@ -221,24 +250,22 @@ async def _async_fetch_metrics():
                     )
                     if resp.status_code == 200:
                         data = resp.json()
-                        likes = data.get("likesSummary", {}).get("totalLikes", 0)
-                        comments = data.get("commentsSummary", {}).get("totalFirstLevelComments", 0)
                         db.table("posted_metrics").insert({
                             "post_id": post["id"],
-                            "likes": likes,
-                            "comments": comments,
+                            "likes": data.get("likesSummary", {}).get("totalLikes", 0),
+                            "comments": data.get("commentsSummary", {}).get("totalFirstLevelComments", 0),
                             "impressions": 0,
                             "shares": 0,
                             "clicks": 0,
                         }).execute()
                         updated += 1
                 except Exception as e:
-                    logger.warning(f"[Scheduler] Metrics fetch failed for {li_id}: {e}")
+                    logger.warning("[Scheduler] Metrics fetch failed for %s: %s", li_id, e)
 
-        logger.info(f"[Scheduler] Metrics fetch done — {updated}/{len(posts)} posts updated")
+        logger.info("[Scheduler] Metrics fetch done — %d/%d posts updated", updated, len(posts))
 
     except Exception as e:
-        logger.error(f"[Scheduler] Metrics fetch crashed: {e}")
+        logger.error("[Scheduler] Metrics fetch crashed: %s", e)
 
 
 # ---------------------------------------------------------------------------
@@ -248,45 +275,31 @@ async def _async_fetch_metrics():
 def start_scheduler():
     """Register all jobs and start the BackgroundScheduler."""
 
-    # Posting jobs
     scheduler.add_job(
         job_post_tuesday,
         CronTrigger(day_of_week="tue", hour=8, minute=30, timezone=IST),
-        id="post_tuesday",
-        replace_existing=True,
+        id="post_tuesday", replace_existing=True,
     )
     scheduler.add_job(
         job_post_wednesday,
         CronTrigger(day_of_week="wed", hour=12, minute=0, timezone=IST),
-        id="post_wednesday",
-        replace_existing=True,
+        id="post_wednesday", replace_existing=True,
     )
     scheduler.add_job(
         job_post_thursday,
         CronTrigger(day_of_week="thu", hour=9, minute=0, timezone=IST),
-        id="post_thursday",
-        replace_existing=True,
+        id="post_thursday", replace_existing=True,
     )
-
-    # Missed approval check — every 5 minutes
     scheduler.add_job(
         job_check_missed_approvals,
-        "interval",
-        minutes=5,
-        id="missed_approvals",
-        replace_existing=True,
+        "interval", minutes=5,
+        id="missed_approvals", replace_existing=True,
     )
-
-    # Session health — every 6 hours
     scheduler.add_job(
         job_check_session_health,
-        "interval",
-        hours=6,
-        id="session_health",
-        replace_existing=True,
+        "interval", hours=6,
+        id="session_health", replace_existing=True,
     )
-
-    # Content generation — Mon/Tue/Wed at 6:00 AM IST
     scheduler.add_job(
         job_generate_content,
         CronTrigger(day_of_week="mon", hour=6, minute=0, timezone=IST),
@@ -311,8 +324,6 @@ def start_scheduler():
         replace_existing=True,
         misfire_grace_time=3600,
     )
-
-    # Weekly LinkedIn metrics fetch — Monday 9:00 AM IST (Phase 6)
     scheduler.add_job(
         job_fetch_metrics,
         CronTrigger(day_of_week="mon", hour=9, minute=0, timezone=IST),
