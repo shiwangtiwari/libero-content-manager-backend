@@ -11,11 +11,13 @@ Priority rules (master doc Section 11.1):
   P1: Telegram input from Shiwang in last 7 days — always wins
   P2: LinkedIn trending topic that fills a gap in last 20 posts (both conditions required)
   P3: LinkedIn trending topic even if partially covered — last resort
+  P_fallback: Random topic from Shiwang's evergreen pool (reflects his niche + personality)
 """
 
 from __future__ import annotations
 
 import logging
+import random
 import re
 from dataclasses import dataclass
 from typing import Any
@@ -27,6 +29,7 @@ logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Niche content filter — topic must match at least one category
+# All patterns kept — NextLeap/fellowship are valid niche signals
 # ---------------------------------------------------------------------------
 _NICHE_PATTERNS: list[re.Pattern] = [re.compile(p, re.I) for p in [
     r"\bproduct\s*manag",
@@ -71,6 +74,28 @@ def _topic_is_covered(topic: str, covered_keywords: set[str]) -> bool:
     topic_lower = topic.lower()
     hits = sum(1 for kw in covered_keywords if kw in topic_lower)
     return hits >= 2
+
+
+# ---------------------------------------------------------------------------
+# Evergreen fallback topic pool
+# Reflects Shiwang's actual niche, personality, and journey.
+# Used ONLY when ALL external signal sources are empty (very rare).
+# Topics rotate randomly so repeats are unlikely across weeks.
+# ---------------------------------------------------------------------------
+_FALLBACK_TOPICS = [
+    "The real difference between thinking like a developer and thinking like a PM",
+    "What building an autonomous system taught me about product decisions",
+    "Why most developers underestimate how much their technical background helps in PM",
+    "The hardest part of personal branding: writing about yourself without sounding like a LinkedIn robot",
+    "What India's PM job market actually looks like from someone navigating it right now",
+    "The gap between PM frameworks you learn and the decisions you actually make",
+    "How I think about building things that work when I'm not watching",
+    "AI tools I use daily and which ones are actually changing how I work",
+    "What good prioritisation looks like when you have zero data",
+    "The difference between shipping a feature and solving a problem",
+    "Why I started posting on LinkedIn and what I'm actually trying to say",
+    "What the transition from engineering to product really feels like from the inside",
+]
 
 
 # ---------------------------------------------------------------------------
@@ -119,7 +144,6 @@ def _build_signal_card(
 def _input_to_topic(message: str) -> str:
     """Convert a raw Telegram message to a post topic."""
     topic = message.strip().rstrip("?").strip()
-    # If long paragraph, use first sentence
     if len(topic) > 80:
         for sep in [".", "!", "\n"]:
             if sep in topic:
@@ -136,7 +160,7 @@ def _detect_niche_matches(topic: str) -> list[str]:
     if re.search(r"dev\s*to\s*pm|engineer\s*to|technical\s*pm|coding|developer", t):
         matches.append("Developer-to-PM")
     if re.search(r"nextleap|fellowship|pm\s*program", t):
-        matches.append("NextLeap fellowship")
+        matches.append("NextLeap journey")
     if re.search(r"ai\s*(in|for|and|tool)|llm|chatgpt|ai\s*product", t):
         matches.append("AI in PM")
     if re.search(r"india|indian|startup|saas", t):
@@ -184,6 +208,21 @@ def _human_time(iso_str: str) -> str:
         return iso_str
 
 
+def _pick_fallback_topic(covered_keywords: set[str]) -> str:
+    """
+    Pick a fallback topic that hasn't been covered recently.
+    Shuffles the pool and returns the first uncovered topic.
+    Falls back to a random topic if all are covered (very unlikely).
+    """
+    pool = _FALLBACK_TOPICS.copy()
+    random.shuffle(pool)
+    for topic in pool:
+        if not _topic_is_covered(topic, covered_keywords):
+            return topic
+    # All covered — just pick randomly
+    return random.choice(_FALLBACK_TOPICS)
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -191,7 +230,7 @@ def _human_time(iso_str: str) -> str:
 def select_topic(bundle: SignalBundle) -> TopicSelection:
     """
     Score all signals and return the best topic.
-    Never raises — falls back to hardcoded topic if everything is empty.
+    Never raises — falls back to evergreen pool if everything is empty.
     """
     trending_strings = [lt.topic for lt in bundle.linkedin_topics]
     niche_topics = [lt for lt in bundle.linkedin_topics if _matches_niche(lt.topic)]
@@ -257,7 +296,7 @@ def select_topic(bundle: SignalBundle) -> TopicSelection:
             telegram_input_id=None, last_5_post_topics=last5,
         )
 
-    # --- Fallback: use any available topic ---
+    # --- Fallback: use any non-niche trending topic if available ---
     if bundle.linkedin_topics:
         lt = bundle.linkedin_topics[0]
         sc = _build_signal_card(
@@ -276,19 +315,19 @@ def select_topic(bundle: SignalBundle) -> TopicSelection:
             telegram_input_id=None, last_5_post_topics=last5,
         )
 
-    # --- Absolute fallback ---
-    topic = "What I'm learning in my first month as a NextLeap PM Fellow"
+    # --- Absolute fallback: evergreen pool (all external sources empty) ---
+    topic = _pick_fallback_topic(bundle.covered_keyword_set)
     sc = _build_signal_card(
-        priority="fallback_hardcoded",
+        priority="fallback_evergreen",
         selected_topic=topic,
-        trigger="All signal sources empty — using hardcoded fallback",
+        trigger="All external signals empty — using evergreen topic from your niche pool",
         trending_topics=[],
         gap_filled="",
         telegram_input_used="",
-        niche_matches=["NextLeap fellowship", "Developer-to-PM"],
+        niche_matches=_detect_niche_matches(topic),
         last_5_post_topics=last5,
     )
-    logger.error("All signals empty — hardcoded fallback topic used")
+    logger.warning("Evergreen fallback selected: '%s'", topic)
     return TopicSelection(
         topic=topic, priority="P_fallback", signal_card=sc,
         telegram_input_id=None, last_5_post_topics=last5,
