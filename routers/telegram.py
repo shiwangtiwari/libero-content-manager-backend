@@ -69,11 +69,25 @@ async def handle_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     health = queries.get_all_session_health()
     queue = queries.get_posts_by_status(["draft", "approved", "scheduled", "pending_reschedule"])
 
+    # Only show health rows that are actually relevant (skip chatgpt/gemini)
+    relevant_platforms = {"claude", "libero"}
     health_lines = ""
     for h in health:
+        if h["platform"] not in ("claude", "libero"):
+            continue
         name = _PLATFORM_DISPLAY.get(h["platform"], h["platform"].upper())
         status = "ONLINE" if h["is_healthy"] else "FAULT"
         health_lines += f"\n  {name:<12} {status}"
+
+    # If no relevant health rows found, just show Libero based on env var
+    if not health_lines:
+        import os
+        key_ok = bool(os.environ.get("ANTHROPIC_API_KEY", "").strip())
+        health_lines = f"\n  LIBERO       {'ONLINE' if key_ok else 'FAULT'}"
+
+    # Queue breakdown
+    approved_posts = [p for p in queue if p["status"] == "approved"]
+    draft_posts    = [p for p in queue if p["status"] in ("draft", "pending_reschedule")]
 
     next_post = None
     for post in sorted(queue, key=lambda p: p.get("scheduled_time") or ""):
@@ -86,6 +100,11 @@ async def handle_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         if next_post else "  NEXT        none scheduled"
     )
 
+    queue_breakdown = (
+        f"  APPROVED    {len(approved_posts)} post(s) — will go live automatically\n"
+        f"  DRAFTS      {len(draft_posts)} post(s) — awaiting your approval"
+    )
+
     msg = (
         f"<b>LIBERO / STATUS</b>\n"
         f"<code>{now_ist}</code>\n\n"
@@ -93,7 +112,7 @@ async def handle_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         f"<code>{health_lines}</code>\n\n"
         f"<b>QUEUE</b>\n"
         f"<code>{next_info}\n"
-        f"  COUNT       {len(queue)} post(s)</code>"
+        f"{queue_breakdown}</code>"
     )
     await update.message.reply_text(msg, parse_mode="HTML")
 
