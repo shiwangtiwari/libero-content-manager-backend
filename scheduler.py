@@ -114,13 +114,16 @@ async def _run_posting_job(slot_label: str):
             result = await post_to_linkedin(post_id)
             # Success — mark as posted (mark_post_posted sets status='posted')
             post_url = f"https://www.linkedin.com/feed/update/{result['linkedin_post_id']}"
+            img_status = "WITH IMAGE" if result.get("posted_with_image") else "TEXT ONLY"
             await send_telegram_message(
                 f"<b>[POSTED]</b>\n\n"
                 f"<code>SLOT       {slot_label}\n"
+                f"IMAGE      {img_status}\n"
                 f"LI ID      {result['linkedin_post_id'][:20]}</code>\n\n"
                 f"View: {post_url}",
             )
-            logger.info("[Scheduler] Posted successfully: %s", result["linkedin_post_id"])
+            logger.info("[Scheduler] Posted successfully: %s (image=%s)",
+                        result["linkedin_post_id"], result.get("posted_with_image"))
 
         except Exception as e:
             # Failure — revert status to 'approved' so dashboard retry works
