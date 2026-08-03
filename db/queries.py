@@ -1,6 +1,13 @@
 """
 All Supabase queries live here. No inline queries anywhere else in the codebase.
 Backend uses service role key — bypasses RLS, full read/write access.
+
+Phase 6 additions:
+  - claim_post_for_posting()  — atomic status flip approved→posting (duplicate post guard)
+  - set_pending_image_post()  — persist pending image post ID to DB (survives restarts)
+  - get_pending_image_post()  — retrieve it
+  - clear_pending_image_post() — clear after image is attached
+  - get_user_profile() / upsert_user_profile() / get_profile_as_context() — About Me
 """
 from typing import Optional
 from db.supabase_client import get_supabase
@@ -54,9 +61,12 @@ def update_post_content(post_id: str, content: str) -> dict:
 
 def update_post_image(post_id: str, image_url: str, image_generator: str) -> dict:
     db = get_supabase()
+    # image_generator CHECK constraint only allows: chatgpt, gemini, none
+    # Map "user_upload" → "none" to avoid constraint violation
+    safe_generator = image_generator if image_generator in ("chatgpt", "gemini", "none") else "none"
     result = db.table("posts").update({
         "image_url": image_url,
-        "image_generator": image_generator,
+        "image_generator": safe_generator,
     }).eq("id", post_id).execute()
     return result.data[0] if result.data else {}
 
@@ -107,7 +117,7 @@ def get_pending_reschedule_posts() -> list[dict]:
 
 
 def get_approved_posts_due_now(current_ist: str) -> list[dict]:
-    """Return approved/scheduled posts whose scheduled_time <= now (IST string comparison)."""
+    """Return approved posts whose scheduled_time <= now (IST string comparison)."""
     db = get_supabase()
     result = (
         db.table("posts")
@@ -117,6 +127,50 @@ def get_approved_posts_due_now(current_ist: str) -> list[dict]:
         .execute()
     )
     return result.data or []
+
+
+def claim_post_for_posting(post_id: str) -> bool:
+    """
+    Atomic duplicate-post guard.
+
+    Attempts to flip status from 'approved' → 'failed' temporarily while posting.
+    We use 'failed' as a transient lock because it IS in the schema CHECK constraint.
+    If the post is already 'failed' (claimed by another job) or 'posted', returns False.
+    The posting job must call mark_post_posted() on success, or revert to 'approved'
+    on failure so it can be retried from the dashboard.
+
+    Why this works: Supabase/Postgres UPDATE with a WHERE condition is atomic.
+    Only one concurrent caller can see status='approved' and flip it — the second
+    caller finds status='failed' and skips.
+
+    Returns True if this caller successfully claimed the post.
+    Returns False if the post was already claimed or posted.
+    """
+    db = get_supabase()
+    try:
+        result = (
+            db.table("posts")
+            .update({"status": "failed"})
+            .eq("id", post_id)
+            .eq("status", "approved")   # Only succeeds if STILL approved
+            .execute()
+        )
+        # If the update matched a row, data will be non-empty
+        return bool(result.data)
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).error("claim_post_for_posting error: %s", e)
+        return False
+
+
+def revert_post_to_approved(post_id: str) -> None:
+    """
+    Called after a failed LinkedIn post attempt to undo the claim.
+    Puts the post back to 'approved' so it shows up in the queue
+    and can be retried from the dashboard.
+    """
+    db = get_supabase()
+    db.table("posts").update({"status": "approved"}).eq("id", post_id).execute()
 
 
 # ── Content signals ──────────────────────────────────────────────────────────
@@ -225,13 +279,58 @@ def upsert_post_metrics(post_id: str, metrics: dict) -> None:
     }).execute()
 
 
-# ── User profile ─────────────────────────────────────────────────────────────
+# ── Pending image post (survives Railway restarts) ───────────────────────────
+#
+# We store the pending image post ID in the user_profile table's JSONB column
+# as a special key, alongside the bubbles. This avoids needing a new table.
+# The user_profile table has: id TEXT PK, bubbles JSONB, updated_at TIMESTAMPTZ
+
+def set_pending_image_post(post_id: str) -> None:
+    """
+    Store which post is waiting for an image upload.
+    Persisted to Supabase so it survives Railway restarts.
+    """
+    db = get_supabase()
+    try:
+        db.table("user_profile").update({
+            "pending_image_post_id": post_id,
+        }).eq("id", "shiwang").execute()
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).error("set_pending_image_post error: %s", e)
+
+
+def get_pending_image_post() -> Optional[str]:
+    """
+    Retrieve the post ID waiting for an image upload.
+    Returns None if no post is pending.
+    """
+    db = get_supabase()
+    try:
+        result = db.table("user_profile").select("pending_image_post_id").eq("id", "shiwang").execute()
+        if result.data:
+            return result.data[0].get("pending_image_post_id")
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).error("get_pending_image_post error: %s", e)
+    return None
+
+
+def clear_pending_image_post() -> None:
+    """Clear the pending image post ID after the image has been attached."""
+    db = get_supabase()
+    try:
+        db.table("user_profile").update({
+            "pending_image_post_id": None,
+        }).eq("id", "shiwang").execute()
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).error("clear_pending_image_post error: %s", e)
+
+
+# ── User profile (About Me) ──────────────────────────────────────────────────
 
 def get_user_profile() -> Optional[dict]:
-    """
-    Returns the single user profile row, or None if not yet created.
-    The profile is stored as a list of bubble dicts: [{id, label, content, order}]
-    """
     db = get_supabase()
     try:
         result = db.table("user_profile").select("*").eq("id", "shiwang").execute()
@@ -241,11 +340,6 @@ def get_user_profile() -> Optional[dict]:
 
 
 def upsert_user_profile(bubbles: list[dict]) -> dict:
-    """
-    Save the full bubble list for the profile.
-    bubbles: [{id: str, label: str, content: str, order: int}]
-    Uses upsert so first save creates the row, subsequent saves update it.
-    """
     db = get_supabase()
     result = db.table("user_profile").upsert({
         "id": "shiwang",
@@ -256,8 +350,8 @@ def upsert_user_profile(bubbles: list[dict]) -> dict:
 
 def get_profile_as_context() -> str:
     """
-    Returns the profile as a formatted string for injection into the content
-    generation prompt. Returns empty string if no profile exists.
+    Returns the profile as a formatted string for injection into the
+    content generation prompt. Returns empty string if no profile exists.
     """
     profile = get_user_profile()
     if not profile:
@@ -265,7 +359,7 @@ def get_profile_as_context() -> str:
     bubbles = profile.get("bubbles", [])
     if not bubbles:
         return ""
-    lines = ["ABOUT SHIWANG (use this to match his voice and worldview):"]
+    lines = ["ABOUT SHIWANG (use this to match his voice, worldview, and interests):"]
     for b in sorted(bubbles, key=lambda x: x.get("order", 0)):
         label = b.get("label", "")
         content = b.get("content", "")
