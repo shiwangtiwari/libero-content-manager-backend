@@ -65,6 +65,13 @@ async def run_content_pipeline() -> dict[str, Any]:
             last_topics=last_topics_str,
             signal_card=trigger,
         )
+
+        # Strip markdown formatting that LinkedIn renders as literal characters
+        import re as _re
+        post_text = post_text.replace("**", "").replace("__", "")
+        # Clean up any double spaces left behind
+        post_text = _re.sub(r"  +", " ", post_text).strip()
+
         logger.info("Post generated: %d chars", len(post_text))
 
         # Compute viral score
