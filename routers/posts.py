@@ -118,9 +118,86 @@ async def reject_post(post_id: str):
 
 
 @router.patch("/{post_id}/reschedule")
-async def reschedule_post(post_id: str, body: UpdateScheduleRequest):
+async def reschedule_post_patch(post_id: str, body: UpdateScheduleRequest):
     post = queries.get_post_by_id(post_id)
     if not post:
         raise HTTPException(status_code=404, detail="Post not found")
     updated = queries.update_post_status(post_id, "scheduled", {"scheduled_time": body.scheduled_time})
     return updated
+
+
+# ── POST aliases — frontend client uses POST for approve/reject ───────────────
+
+@router.post("/{post_id}/approve")
+async def approve_post_post(post_id: str):
+    """POST alias for approve (frontend sends POST)."""
+    post = queries.get_post_by_id(post_id)
+    if not post:
+        raise HTTPException(status_code=404, detail="Post not found")
+    updated = queries.update_post_status(post_id, "approved")
+    return updated
+
+
+@router.post("/{post_id}/reject")
+async def reject_post_post(post_id: str):
+    """POST alias for reject — also triggers immediate regeneration."""
+    post = queries.get_post_by_id(post_id)
+    if not post:
+        raise HTTPException(status_code=404, detail="Post not found")
+
+    rejected_slot = post.get("scheduled_time")
+    updated = queries.update_post_status(post_id, "rejected")
+
+    # Immediate regeneration if slot is still in the future (>1 hour)
+    if rejected_slot:
+        import asyncio
+        from datetime import datetime
+        import pytz
+        IST = pytz.timezone("Asia/Kolkata")
+        try:
+            slot_dt = IST.localize(datetime.strptime(rejected_slot, "%Y-%m-%d %H:%M"))
+            hours_left = (slot_dt - datetime.now(IST)).total_seconds() / 3600
+            if hours_left > 1:
+                from services.content_pipeline import run_content_pipeline
+                import logging
+                logging.getLogger(__name__).info(
+                    "Post rejected, %.1fh until slot — triggering immediate regen", hours_left
+                )
+                asyncio.create_task(run_content_pipeline())
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).warning("Post-reject regen failed: %s", e)
+
+    return updated
+
+
+# ── Edit draft content ────────────────────────────────────────────────────────
+
+class EditContentRequest(BaseModel):
+    content: str
+
+
+@router.patch("/{post_id}/edit")
+@router.post("/{post_id}/edit")
+async def edit_post_content(post_id: str, body: EditContentRequest):
+    """Edit the content of a draft post. Strips markdown bold automatically."""
+    post = queries.get_post_by_id(post_id)
+    if not post:
+        raise HTTPException(status_code=404, detail="Post not found")
+    if post["status"] == "posted":
+        raise HTTPException(status_code=400, detail="Cannot edit a post that has already been published")
+
+    # Strip markdown formatting + validate length
+    import re
+    cleaned = body.content.replace("**", "").replace("__", "")
+    cleaned = re.sub(r"  +", " ", cleaned).strip()
+
+    # LinkedIn hard limit: 3000 characters
+    if len(cleaned) > 3000:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Content is {len(cleaned)} characters — LinkedIn limit is 3000. Shorten by {len(cleaned) - 3000} chars."
+        )
+
+    updated = queries.update_post_content(post_id, cleaned)
+    return {"ok": True, "post": updated, "char_count": len(cleaned)}
