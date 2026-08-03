@@ -90,22 +90,10 @@ async def run_session_health_check() -> dict:
     else:
         logger.info("[health_monitor] LinkedIn token: OK")
 
-    # ── ChatGPT cookies (presence check only — Playwright blocked) ─────────
-    chatgpt_present = bool(os.environ.get("CHATGPT_COOKIES", "").strip().startswith("["))
-    update_session_health(
-        platform="chatgpt",
-        is_healthy=chatgpt_present,
-        last_error=None if chatgpt_present else "CHATGPT_COOKIES not set",
-    )
-    # Note: not sending alert for missing ChatGPT cookies —
-    # image flow is prompt-based (user generates externally), so this is non-critical.
-
-    gemini_present = bool(os.environ.get("GEMINI_COOKIES", "").strip().startswith("["))
-    update_session_health(
-        platform="gemini",
-        is_healthy=gemini_present,
-        last_error=None if gemini_present else "GEMINI_COOKIES not set",
-    )
+    # ChatGPT and Gemini session checks removed — Playwright is blocked on Railway.
+    # Image generation is prompt-based: system sends a prompt, Shiwang generates
+    # the image externally and sends it back via Telegram photo.
+    # No cookie-based session tracking needed or useful.
 
     # ── Send consolidated alert if anything critical is broken ─────────────
     if issues:
@@ -120,16 +108,28 @@ async def run_session_health_check() -> dict:
 
 
 async def _check_anthropic_key() -> bool:
-    """
-    Format-check only — no API call made.
-    Saves ~$0.20/year vs pinging the API every 6 hours.
-    Real validation happens naturally when the content pipeline runs.
-    """
     api_key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
-    valid = bool(api_key and api_key.startswith("sk-ant-") and len(api_key) > 20)
-    if not valid:
-        logger.warning("[health_monitor] ANTHROPIC_API_KEY missing or malformed")
-    return valid
+    if not api_key:
+        return False
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={
+                    "x-api-key": api_key,
+                    "anthropic-version": "2023-06-01",
+                    "content-type": "application/json",
+                },
+                json={
+                    "model": "claude-sonnet-4-5",
+                    "max_tokens": 10,
+                    "messages": [{"role": "user", "content": "ping"}],
+                },
+            )
+            return resp.status_code == 200
+    except Exception as e:
+        logger.error(f"[health_monitor] Anthropic key check failed: {e}")
+        return False
 
 
 async def _check_linkedin_token() -> bool:
