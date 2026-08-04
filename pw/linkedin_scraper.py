@@ -5,15 +5,21 @@ Reality: LinkedIn blocks Railway datacenter IPs for scraping.
 Strategy: Multi-layer fallback that always returns something useful.
 
 Layer 1: LinkedIn public HTTP (best effort, usually blocked)
-Layer 2: Niche topic pool rotated by date (always works, deterministic)
+Layer 2: Full niche topic pool — all 46 topics, one per category per run,
+         filtered against recently used topics and angles.
+Layer 3: Custom topics added by Shiwang via Telegram (stored in Supabase)
 
-The result feeds into content_signals table via signal_collector.py.
-Table used: content_signals (source = 'linkedin_trending')
+Key changes (2026-08-04):
+- OLD: _rotate_pool(n=6) returned only 6 topics per day via date-based shuffle.
+  This meant only 3-4 non-PM topics surfaced and the brain always picked PM.
+- NEW: get_full_pool() returns ALL topics from the pool (46 hardcoded + custom
+  from Supabase), with one topic per category. The brain receives the full
+  diverse set and picks based on what hasn't been used recently.
+- Custom topics from Supabase custom_topics table are merged into the same pool.
 """
 
 from __future__ import annotations
 
-import hashlib
 import logging
 from datetime import date
 
@@ -23,19 +29,12 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Niche topic pool — rotated deterministically by date
-# These are always-valid PM/tech/developer topics for Shiwang's niche
-# ---------------------------------------------------------------------------
-# ---------------------------------------------------------------------------
-# Topic pool — diverse, reflects Shiwang's actual life and interests.
-# Intentionally NOT all PM topics. Mix of PM, building, gaming, culture,
-# India tech, AI, and personal observations.
-#
-# Rule: no two consecutive pool-selected posts should be from the same category.
-# The _rotate_pool_diverse() function enforces category alternation.
+# Niche topic pool — all topics, diverse categories
+# Covers Shiwang's full identity: PM, Dev-to-PM, Building, AI, India Tech,
+# Gaming, Personal, Culture. NOT just PM topics.
 # ---------------------------------------------------------------------------
 _NICHE_POOL: list[dict[str, str]] = [
-    # Product Management — core craft
+    # Product Management — PM craft and career
     {"topic": "PM Interview Preparation", "category": "Product Management"},
     {"topic": "How to Write a Product Spec", "category": "Product Management"},
     {"topic": "North Star Metrics for Product Teams", "category": "Product Management"},
@@ -46,98 +45,187 @@ _NICHE_POOL: list[dict[str, str]] = [
     {"topic": "User Research for Product Managers", "category": "Product Management"},
     {"topic": "Data-Driven Product Decisions", "category": "Product Management"},
     {"topic": "OKRs for Product Teams", "category": "Product Management"},
-    # Developer to PM — transition story
+
+    # Developer to PM — the transition story
     {"topic": "Developer to PM Transition", "category": "Developer-to-PM"},
     {"topic": "Why Engineers Make Great PMs", "category": "Developer-to-PM"},
     {"topic": "Using Coding Skills in Product Management", "category": "Developer-to-PM"},
     {"topic": "From Engineer to Product Leader", "category": "Developer-to-PM"},
     {"topic": "Technical Debt and PM Decisions", "category": "Developer-to-PM"},
     {"topic": "Reading Technical Docs as a PM", "category": "Developer-to-PM"},
-    # Building things — autonomous systems, side projects
+
+    # Building — making things, shipping, autonomy
     {"topic": "Building things that work when you are not watching", "category": "Building"},
     {"topic": "What I learned building an autonomous content system", "category": "Building"},
     {"topic": "Why I automated my LinkedIn presence", "category": "Building"},
     {"topic": "The difference between a project and a product", "category": "Building"},
     {"topic": "When to build vs when to buy", "category": "Building"},
     {"topic": "Shipping something real vs shipping something perfect", "category": "Building"},
-    # AI — tools, observations, real usage
+
+    # AI — tools, workflows, honest takes
     {"topic": "AI Tools for Product Managers in 2025", "category": "AI"},
     {"topic": "How I actually use Claude and ChatGPT in my workflow", "category": "AI"},
     {"topic": "The gap between AI hype and AI usefulness", "category": "AI"},
     {"topic": "AI-First Product Thinking", "category": "AI"},
     {"topic": "What Copilot taught me about how developers really work", "category": "AI"},
     {"topic": "When AI makes you faster and when it makes you lazy", "category": "AI"},
-    # India tech — startup ecosystem, job market
+
+    # India Tech — Indian ecosystem, startups, PM jobs
     {"topic": "PM Roles in Indian Startups", "category": "India Tech"},
     {"topic": "Breaking into Product Management in India", "category": "India Tech"},
     {"topic": "What India's startup ecosystem looks like from the inside", "category": "India Tech"},
     {"topic": "SaaS PM vs Consumer PM in India", "category": "India Tech"},
     {"topic": "Why Indian developers are underrated globally", "category": "India Tech"},
-    # Gaming — GTA 6, pre-orders, launch psychology
+
+    # Gaming — Shiwang's genuine interest, connected to product thinking
     {"topic": "GTA 6 pre-order psychology and what it teaches product managers", "category": "Gaming"},
     {"topic": "Why gaming communities are the best product feedback loops", "category": "Gaming"},
     {"topic": "What game design gets right that most apps get wrong", "category": "Gaming"},
     {"topic": "The product lessons inside open-world games", "category": "Gaming"},
-    # Personal observations — life, discipline, how I see things
+
+    # Personal — real observations, discipline, honesty
     {"topic": "What consistency looks like when no one is watching", "category": "Personal"},
     {"topic": "The habit I built that changed how I think about shipping", "category": "Personal"},
     {"topic": "Why I started documenting instead of performing on LinkedIn", "category": "Personal"},
     {"topic": "What I wish I knew before switching from engineering to product", "category": "Personal"},
     {"topic": "The day I stopped waiting to feel ready", "category": "Personal"},
-    # Culture and pop references — Bollywood, OTT, trending India moments
+
+    # Culture — India moments, OTT, pop references used as PM lenses
     {"topic": "What the Ramayana remake teaches us about audience expectations", "category": "Culture"},
     {"topic": "Lessons from how OTT platforms killed weekend plans", "category": "Culture"},
     {"topic": "What Netflix India gets right about product-market fit", "category": "Culture"},
     {"topic": "The Kota Factory effect — what Indian ambition actually looks like", "category": "Culture"},
 ]
 
+# Category order for diversity rotation — ensures variety in what the brain sees
+_CATEGORY_ORDER = [
+    "Building",
+    "Personal",
+    "AI",
+    "Culture",
+    "Gaming",
+    "India Tech",
+    "Developer-to-PM",
+    "Product Management",
+]
 
-def _rotate_pool(n: int = 6) -> list[dict[str, str]]:
+
+def _get_custom_topics() -> list[dict[str, str]]:
+    """Pull active custom topics from Supabase custom_topics table."""
+    try:
+        from db.supabase_client import get_supabase
+        db = get_supabase()
+        result = db.table("custom_topics").select("topic, category").eq("active", True).execute()
+        return [
+            {"topic": r["topic"], "category": r.get("category", "Personal")}
+            for r in (result.data or [])
+            if r.get("topic")
+        ]
+    except Exception as exc:
+        logger.debug("[scraper] Custom topics fetch failed (non-fatal): %s", exc)
+        return []
+
+
+def _get_used_topic_slugs(n: int = 7) -> set[str]:
     """
-    Return N topics from the pool with two guarantees:
-    1. Topics rotate by date — different set surfaces each day, no state needed.
-    2. No two consecutive topics are from the same category.
-       This prevents "Building a Personal Brand as PM" followed by
-       "Developer to PM Transition" (both feel like the same post).
+    Return topic slugs used in the last n posts (posted + queued).
+    A slug is the topic string lowercased and stripped.
+    Topics in this set are blocked for the current selection.
     """
-    today = date.today().isoformat()
-    seed = int(hashlib.md5(today.encode()).hexdigest(), 16)
-    pool = _NICHE_POOL.copy()
-    # Shuffle deterministically by date
-    for i in range(len(pool) - 1, 0, -1):
-        j = seed % (i + 1)
-        pool[i], pool[j] = pool[j], pool[i]
-        seed = (seed >> 1) or 1
+    try:
+        from db.queries import get_last_n_posts, get_posts_by_status
 
-    # Pick n topics ensuring no two consecutive are same category
-    result = []
-    used_indices = set()
-    last_category = None
-    attempts = 0
-    while len(result) < n and attempts < len(pool) * 2:
-        attempts += 1
-        for i, topic in enumerate(pool):
-            if i in used_indices:
-                continue
-            if topic["category"] != last_category:
-                result.append(topic)
-                used_indices.add(i)
-                last_category = topic["category"]
-                break
-        else:
-            # All remaining topics are same category — just take the next unused one
-            for i, topic in enumerate(pool):
-                if i not in used_indices:
-                    result.append(topic)
-                    used_indices.add(i)
-                    last_category = topic["category"]
-                    break
+        used: set[str] = set()
 
-    return result[:n]
+        # Last n posted
+        for post in get_last_n_posts(n=n):
+            sc = post.get("signal_card") or {}
+            topic = sc.get("selected_topic", "")
+            if topic:
+                used.add(topic.lower().strip())
+            slug = post.get("topic_slug", "")
+            if slug:
+                used.add(slug.lower().strip())
+
+        # Currently queued (draft/approved — don't repeat these either)
+        for post in get_posts_by_status(["draft", "approved", "scheduled", "pending_reschedule"]):
+            sc = post.get("signal_card") or {}
+            topic = sc.get("selected_topic", "")
+            if topic:
+                used.add(topic.lower().strip())
+
+        return used
+    except Exception as exc:
+        logger.debug("[scraper] Used topic slugs fetch failed (non-fatal): %s", exc)
+        return set()
+
+
+def get_full_pool(used_topic_slugs: set[str] | None = None) -> list[dict[str, str]]:
+    """
+    Return the full topic pool — all 46 hardcoded + custom from Supabase.
+    One topic per category, ordered by _CATEGORY_ORDER for diversity.
+    Topics in used_topic_slugs are skipped.
+
+    This replaces the old _rotate_pool(n=6) which only returned 6 topics
+    per day, causing the brain to always pick from a PM-heavy subset.
+    """
+    if used_topic_slugs is None:
+        used_topic_slugs = set()
+
+    # Merge hardcoded pool + custom topics
+    all_topics = _NICHE_POOL.copy()
+    custom = _get_custom_topics()
+    if custom:
+        logger.info("[scraper] Adding %d custom topics from Supabase", len(custom))
+        all_topics.extend(custom)
+
+    # Group by category, filter out used topics
+    by_category: dict[str, list[dict]] = {}
+    for t in all_topics:
+        cat = t.get("category", "Personal")
+        if t["topic"].lower().strip() not in used_topic_slugs:
+            by_category.setdefault(cat, []).append(t)
+
+    # Pick one per category in diversity order
+    # Use today's date as a secondary shuffle within each category
+    # so the same topic doesn't always surface first within a category
+    from datetime import date as _date
+    import hashlib as _hashlib
+    today_seed = int(_hashlib.md5(_date.today().isoformat().encode()).hexdigest(), 16)
+
+    result: list[dict[str, str]] = []
+    all_categories = list(_CATEGORY_ORDER)
+    # Add any custom categories not in the order list
+    for cat in by_category:
+        if cat not in all_categories:
+            all_categories.append(cat)
+
+    for cat in all_categories:
+        topics_in_cat = by_category.get(cat, [])
+        if not topics_in_cat:
+            continue
+        # Pick one topic from this category using date seed
+        idx = today_seed % len(topics_in_cat)
+        result.append({**topics_in_cat[idx], "source": "niche_pool"})
+
+    # Fall back: if we blocked too many and result is tiny, add some used topics back
+    if len(result) < 3:
+        logger.warning("[scraper] Pool nearly exhausted — relaxing used-topic filter")
+        for cat in all_categories:
+            all_in_cat = [t for t in all_topics if t.get("category") == cat]
+            if all_in_cat and not any(r.get("category") == cat for r in result):
+                idx = today_seed % len(all_in_cat)
+                result.append({**all_in_cat[idx], "source": "niche_pool"})
+
+    logger.info(
+        "[scraper] Full pool: %d topics across %d categories (after filtering %d used)",
+        len(result), len(by_category), len(used_topic_slugs),
+    )
+    return result
 
 
 # ---------------------------------------------------------------------------
-# HTTP attempt (best effort)
+# HTTP attempt (best effort — usually blocked on Railway)
 # ---------------------------------------------------------------------------
 
 async def _try_http_topics() -> list[dict[str, str]]:
@@ -173,26 +261,25 @@ async def _try_http_topics() -> list[dict[str, str]]:
 
 async def collect_linkedin_topics() -> list[dict[str, str]]:
     """
-    Return a list of trending topic dicts:
-      [{"topic": "...", "category": "...", "source": "..."}, ...]
-
-    Never raises. Always returns at least the rotated niche pool.
-    Each dict is safe to pass directly to queries.create_signal().
+    Return full topic list for content_signals caching.
+    Never raises. Always returns at least the full niche pool.
     """
-    topics: list[dict[str, str]] = []
+    # Get used topics to filter pool
+    used_slugs = _get_used_topic_slugs(n=7)
 
-    # Try HTTP
+    # Try HTTP (usually blocked, non-fatal)
+    topics: list[dict[str, str]] = []
     http_topics = await _try_http_topics()
     if http_topics:
         logger.info("HTTP LinkedIn topics: %d", len(http_topics))
         topics.extend(http_topics)
 
-    # Always add niche pool to guarantee variety
-    pool = _rotate_pool(n=6)
-    for t in pool:
-        t["source"] = "niche_pool"
+    # Always add full pool
+    pool = get_full_pool(used_topic_slugs=used_slugs)
     topics.extend(pool)
 
-    logger.info("Total topics available: %d (%d from HTTP, %d from pool)",
-                len(topics), len(http_topics), len(pool))
+    logger.info(
+        "Total topics available: %d (%d from HTTP, %d from pool)",
+        len(topics), len(http_topics), len(pool),
+    )
     return topics
