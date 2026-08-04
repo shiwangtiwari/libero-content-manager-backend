@@ -11,6 +11,18 @@ Priority rules (master doc Section 11.1):
   P1: Telegram input from Shiwang in last 7 days — always wins
   P2: LinkedIn trending topic that fills a gap in last 20 posts (both conditions required)
   P3: LinkedIn trending topic even if partially covered — last resort
+
+Fix (2026-08-04):
+  Category avoidance rules — applied in this order:
+    1. HARD BLOCK: if a topic's primary category is already sitting in queue
+       (draft/approved), we skip it entirely. Two approved PM posts in queue = next
+       generation must pick something else.
+    2. SOFT BLOCK (category-gap window): if the same category appeared in the last
+       MIN_CATEGORY_GAP_POSTS posts (default 6), prefer a different category.
+       This allows PM posts to come back — just with a buffer of other content.
+       The gap window check uses signal_collector.category_recently_used().
+    3. If no topic can satisfy all constraints, we relax them one by one
+       (soft → hard → fallback) and always generate something.
 """
 
 from __future__ import annotations
@@ -20,7 +32,7 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
-from services.signal_collector import SignalBundle, LinkedInTopic
+from services.signal_collector import SignalBundle, LinkedInTopic, category_recently_used
 
 logger = logging.getLogger(__name__)
 
@@ -119,7 +131,6 @@ def _build_signal_card(
 def _input_to_topic(message: str) -> str:
     """Convert a raw Telegram message to a post topic."""
     topic = message.strip().rstrip("?").strip()
-    # If long paragraph, use first sentence
     if len(topic) > 80:
         for sep in [".", "!", "\n"]:
             if sep in topic:
@@ -164,20 +175,6 @@ def _last_5_topics(bundle: SignalBundle) -> list[str]:
     return topics
 
 
-def _last_2_categories(bundle: SignalBundle) -> list[str]:
-    """
-    Return the niche categories of the last 2 posts.
-    Used to prevent two adjacent posts feeling like the same topic area.
-    """
-    categories = []
-    for ct in bundle.covered_topics[:2]:
-        sc = ct.signal_card or {}
-        niche = sc.get("niche_match", [])
-        if niche:
-            categories.append(niche[0])
-    return categories
-
-
 def _human_time(iso_str: str) -> str:
     try:
         import datetime, pytz
@@ -198,6 +195,31 @@ def _human_time(iso_str: str) -> str:
         return iso_str
 
 
+def _category_is_blocked(category: str, bundle: SignalBundle) -> tuple[bool, str]:
+    """
+    Check whether a category should be avoided.
+
+    Returns (blocked: bool, reason: str).
+
+    Two-tier avoidance:
+      HARD: category is in queued_category_set (post already in queue with this category)
+      SOFT: category appeared in the last MIN_CATEGORY_GAP_POSTS posts (recent_category_sequence)
+    """
+    if not category or category == "General":
+        return False, ""
+
+    # Hard block: already in queue
+    if category in bundle.queued_category_set:
+        return True, f"HARD BLOCK — '{category}' already in queue"
+
+    # Soft block: appeared too recently
+    from services.signal_collector import MIN_CATEGORY_GAP_POSTS
+    if category_recently_used(category, bundle.recent_category_sequence, MIN_CATEGORY_GAP_POSTS):
+        return True, f"SOFT BLOCK — '{category}' in last {MIN_CATEGORY_GAP_POSTS} posts"
+
+    return False, ""
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -206,16 +228,29 @@ def select_topic(bundle: SignalBundle) -> TopicSelection:
     """
     Score all signals and return the best topic.
     Never raises — falls back to hardcoded topic if everything is empty.
+
+    Category avoidance is applied in four passes (P2):
+      Pass 1: gap fill + NOT blocked (hard or soft)
+      Pass 2: gap fill + NOT hard blocked (soft block tolerated)
+      Pass 3: any niche topic + NOT hard blocked
+      Pass 4: any niche topic (all constraints relaxed)
     """
     trending_strings = [lt.topic for lt in bundle.linkedin_topics]
     niche_topics = [lt for lt in bundle.linkedin_topics if _matches_niche(lt.topic)]
     last5 = _last_5_topics(bundle)
+
+    logger.info(
+        "select_topic: queued_categories=%s, recent_seq=%s",
+        bundle.queued_category_set,
+        bundle.recent_category_sequence[:6],
+    )
 
     # --- P1: Telegram input (highest priority, always wins) ---
     if bundle.telegram_inputs:
         inp = bundle.telegram_inputs[0]  # most recent unused
         topic = _input_to_topic(inp.message)
         gap = _gap_description(topic, bundle.covered_keyword_set)
+        niche_matches = _detect_niche_matches(topic) or ["Developer-to-PM"]
         sc = _build_signal_card(
             priority="telegram_input",
             selected_topic=topic,
@@ -223,7 +258,7 @@ def select_topic(bundle: SignalBundle) -> TopicSelection:
             trending_topics=trending_strings,
             gap_filled=gap,
             telegram_input_used=f'"{inp.message[:120]}" — {_human_time(inp.created_at)}',
-            niche_matches=_detect_niche_matches(topic) or ["Developer-to-PM"],
+            niche_matches=niche_matches,
             last_5_post_topics=last5,
         )
         logger.info("P1 selected: '%s' (Telegram input)", topic)
@@ -232,16 +267,14 @@ def select_topic(bundle: SignalBundle) -> TopicSelection:
             telegram_input_id=inp.id, last_5_post_topics=last5,
         )
 
-    # --- P2: Trending topic that fills a content gap AND is a different category ---
-    recent_categories = _last_2_categories(bundle)
-    last_category = recent_categories[0] if recent_categories else None
-
-    # First pass: find topic that fills gap AND is different category from last post
+    # --- P2: Trending + gap fill ---
+    # Pass 1: gap fill + fully unblocked (not hard, not soft)
     for lt in niche_topics:
         if not _topic_is_covered(lt.topic, bundle.covered_keyword_set):
             topic_categories = _detect_niche_matches(lt.topic)
-            topic_primary_cat = topic_categories[0] if topic_categories else ""
-            if topic_primary_cat != last_category:
+            primary_cat = topic_categories[0] if topic_categories else ""
+            blocked, reason = _category_is_blocked(primary_cat, bundle)
+            if not blocked:
                 gap = _gap_description(lt.topic, bundle.covered_keyword_set)
                 sc = _build_signal_card(
                     priority="linkedin_trending",
@@ -253,46 +286,78 @@ def select_topic(bundle: SignalBundle) -> TopicSelection:
                     niche_matches=topic_categories,
                     last_5_post_topics=last5,
                 )
-                logger.info("P2 selected: '%s' (trending + gap fill + category variety)", lt.topic)
+                logger.info("P2 selected: '%s' (gap + unblocked category '%s')", lt.topic, primary_cat)
                 return TopicSelection(
                     topic=lt.topic, priority="P2", signal_card=sc,
                     telegram_input_id=None, last_5_post_topics=last5,
                 )
 
-    # Second pass: fill gap even if same category (better than no gap fill)
+    # Pass 2: gap fill, soft block tolerated (but NOT hard block)
     for lt in niche_topics:
         if not _topic_is_covered(lt.topic, bundle.covered_keyword_set):
-            gap = _gap_description(lt.topic, bundle.covered_keyword_set)
+            topic_categories = _detect_niche_matches(lt.topic)
+            primary_cat = topic_categories[0] if topic_categories else ""
+            # Only check hard block
+            hard_blocked = primary_cat in bundle.queued_category_set
+            if not hard_blocked:
+                gap = _gap_description(lt.topic, bundle.covered_keyword_set)
+                sc = _build_signal_card(
+                    priority="linkedin_trending",
+                    selected_topic=lt.topic,
+                    trigger=f'LinkedIn trending in niche + gap (soft block tolerated): "{lt.topic}"',
+                    trending_topics=trending_strings,
+                    gap_filled=gap,
+                    telegram_input_used="",
+                    niche_matches=topic_categories,
+                    last_5_post_topics=last5,
+                )
+                logger.info(
+                    "P2 selected: '%s' (gap fill, soft block tolerated for '%s')",
+                    lt.topic, primary_cat,
+                )
+                return TopicSelection(
+                    topic=lt.topic, priority="P2", signal_card=sc,
+                    telegram_input_id=None, last_5_post_topics=last5,
+                )
+
+    # --- P3: Any niche topic, not hard blocked ---
+    # Pass 3: any niche topic where category not in queue
+    for lt in niche_topics:
+        topic_categories = _detect_niche_matches(lt.topic)
+        primary_cat = topic_categories[0] if topic_categories else ""
+        hard_blocked = primary_cat in bundle.queued_category_set
+        if not hard_blocked:
             sc = _build_signal_card(
                 priority="linkedin_trending",
                 selected_topic=lt.topic,
-                trigger=f'LinkedIn trending in niche + gap: "{lt.topic}"',
+                trigger=f'LinkedIn trending (gap fill relaxed, not hard-blocked): "{lt.topic}"',
                 trending_topics=trending_strings,
-                gap_filled=gap,
+                gap_filled="",
                 telegram_input_used="",
-                niche_matches=_detect_niche_matches(lt.topic),
+                niche_matches=topic_categories,
                 last_5_post_topics=last5,
             )
-            logger.info("P2 selected: '%s' (trending + gap fill, same category tolerated)", lt.topic)
+            logger.info("P3 selected: '%s' (trending, not hard-blocked)", lt.topic)
             return TopicSelection(
-                topic=lt.topic, priority="P2", signal_card=sc,
+                topic=lt.topic, priority="P3", signal_card=sc,
                 telegram_input_id=None, last_5_post_topics=last5,
             )
 
-    # --- P3: Any niche trending topic, even if partially covered ---
+    # Pass 4: any niche topic, all constraints relaxed (only when queue is completely full
+    # of every possible category — extremely unlikely)
     if niche_topics:
         lt = niche_topics[0]
         sc = _build_signal_card(
             priority="linkedin_trending",
             selected_topic=lt.topic,
-            trigger=f'LinkedIn trending (partial coverage ok): "{lt.topic}"',
+            trigger=f'LinkedIn trending (all avoidance constraints relaxed): "{lt.topic}"',
             trending_topics=trending_strings,
             gap_filled="",
             telegram_input_used="",
             niche_matches=_detect_niche_matches(lt.topic),
             last_5_post_topics=last5,
         )
-        logger.info("P3 selected: '%s' (trending, ignoring coverage)", lt.topic)
+        logger.info("P3 fallback selected: '%s' (all constraints relaxed)", lt.topic)
         return TopicSelection(
             topic=lt.topic, priority="P3", signal_card=sc,
             telegram_input_id=None, last_5_post_topics=last5,
