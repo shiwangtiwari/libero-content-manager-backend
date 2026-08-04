@@ -200,6 +200,20 @@ def _detect_niche_matches(topic: str) -> list[str]:
         elif re.search(r"\bai\b|copilot|llm|hype|faster.*lazy|lazy.*faster", t):
             matches.append("AI in PM")
 
+    # Non-PM category detection for pool topics
+    if not matches:
+        t_lower = topic.lower()
+        if re.search(r"gta|game\s*design|gaming|open.world|game|playstation|xbox", t_lower):
+            matches.append("Gaming")
+        elif re.search(r"when\s*to\s*build|build\s*vs|automat|autonomous|ship|deploy", t_lower):
+            matches.append("Building")
+        elif re.search(r"kota|netflix|ott|bollywood|ramayana|ambition|series|web\s*series", t_lower):
+            matches.append("Culture")
+        elif re.search(r"consistency|habit|documenting|performing|waiting\s*to|stopped\s*waiting|the\s*day\s*i", t_lower):
+            matches.append("Personal")
+        elif re.search(r"ai|copilot|llm|hype|faster.*lazy|lazy.*faster|chatgpt", t_lower):
+            matches.append("AI in PM")
+
     return matches or ["General"]
 
 
@@ -274,6 +288,11 @@ def _category_is_blocked(category: str, bundle: SignalBundle) -> tuple[bool, str
     if not category or category == "General":
         return False, ""
 
+    # Non-PM categories always allowed — they add variety
+    non_blockable = {"Gaming", "Building", "Culture", "Personal", "General", "AI"}
+    if category in non_blockable:
+        return False, ""
+
     # Hard block: already in queue
     if category in bundle.queued_category_set:
         return True, f"HARD BLOCK — '{category}' already in queue"
@@ -302,7 +321,12 @@ def select_topic(bundle: SignalBundle) -> TopicSelection:
       Pass 4: any niche topic (all constraints relaxed — last resort)
     """
     trending_strings = [lt.topic for lt in bundle.linkedin_topics]
-    niche_topics = [lt for lt in bundle.linkedin_topics if _matches_niche(lt.topic)]
+    # Pool topics are pre-curated — bypass _matches_niche so Culture/Gaming/Building
+    # topics are not silently excluded. Only filter HTTP-scraped topics.
+    niche_topics = [
+        lt for lt in bundle.linkedin_topics
+        if lt.source in ("niche_pool", "cache") or _matches_niche(lt.topic)
+    ]
     last5 = _last_5_topics(bundle)
 
     logger.info(
