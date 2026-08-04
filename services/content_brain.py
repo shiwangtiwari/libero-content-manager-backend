@@ -261,6 +261,11 @@ def _category_is_blocked(category: str, bundle: SignalBundle) -> tuple[bool, str
     if not category or category == "General":
         return False, ""
 
+    # Non-PM categories are never blocked — they add variety
+    non_blockable = {"Gaming", "Building", "Culture", "Personal", "General", "AI"}
+    if category in non_blockable:
+        return False, ""
+
     # Hard block: already in queue
     if category in bundle.queued_category_set:
         return True, f"HARD BLOCK — '{category}' already in queue"
@@ -289,7 +294,14 @@ def select_topic(bundle: SignalBundle) -> TopicSelection:
       Pass 4: any niche topic (all constraints relaxed — last resort)
     """
     trending_strings = [lt.topic for lt in bundle.linkedin_topics]
-    niche_topics = [lt for lt in bundle.linkedin_topics if _matches_niche(lt.topic)]
+    # Pool topics (source="niche_pool" or "cache") are pre-curated — don't filter them.
+    # Only apply _matches_niche to HTTP-scraped topics.
+    # Without this, Culture/Gaming/Building/Personal topics are silently excluded
+    # and the brain only ever sees PM topics.
+    niche_topics = [
+        lt for lt in bundle.linkedin_topics
+        if lt.source in ("niche_pool", "cache") or _matches_niche(lt.topic)
+    ]
     last5 = _last_5_topics(bundle)
 
     logger.info(
