@@ -182,3 +182,80 @@ async def trigger_github_actions_test(payload: TriggerTest):
             status_code=500,
             detail=f"GitHub API returned {resp.status_code}: {resp.text}",
         )
+
+
+# ── Market Strategies endpoints (dashboard editable) ──────────────────────────
+
+@router.get("/market-strategies")
+async def get_market_strategies():
+    """Return all active market strategies for dashboard display."""
+    from db.queries import get_all_market_strategies
+    try:
+        strategies = get_all_market_strategies(active_only=False)
+        return {"ok": True, "strategies": strategies, "count": len(strategies)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/market-strategies")
+async def create_market_strategy(payload: dict):
+    """Add a new market strategy from dashboard."""
+    required = ["title", "company", "strategy_name", "the_story", "the_rule", "how_to_use", "wow_factor"]
+    for field in required:
+        if not payload.get(field):
+            raise HTTPException(status_code=400, detail=f"Missing required field: {field}")
+    from db.supabase_client import get_supabase
+    db = get_supabase()
+    result = db.table("market_strategies").insert({
+        "title": payload["title"],
+        "company": payload["company"],
+        "industry": payload.get("industry", "General"),
+        "strategy_name": payload["strategy_name"],
+        "the_story": payload["the_story"],
+        "the_rule": payload["the_rule"],
+        "how_to_use": payload["how_to_use"],
+        "wow_factor": payload["wow_factor"],
+        "active": True,
+        "used": False,
+    }).execute()
+    return {"ok": True, "strategy": result.data[0] if result.data else {}}
+
+
+@router.patch("/market-strategies/{strategy_id}")
+async def update_market_strategy(strategy_id: str, payload: dict):
+    """Update a market strategy from dashboard."""
+    from db.supabase_client import get_supabase
+    db = get_supabase()
+    allowed = ["title", "company", "industry", "strategy_name", "the_story",
+               "the_rule", "how_to_use", "wow_factor", "active", "used"]
+    update_data = {k: v for k, v in payload.items() if k in allowed}
+    if not update_data:
+        raise HTTPException(status_code=400, detail="No valid fields to update")
+    result = db.table("market_strategies").update(update_data).eq("id", strategy_id).execute()
+    return {"ok": True, "strategy": result.data[0] if result.data else {}}
+
+
+@router.delete("/market-strategies/{strategy_id}")
+async def deactivate_market_strategy(strategy_id: str):
+    """Soft-delete (deactivate) a market strategy."""
+    from db.supabase_client import get_supabase
+    db = get_supabase()
+    db.table("market_strategies").update({"active": False}).eq("id", strategy_id).execute()
+    return {"ok": True, "message": f"Strategy {strategy_id} deactivated"}
+
+
+@router.post("/market-strategies/{strategy_id}/reset")
+async def reset_market_strategy_used(strategy_id: str):
+    """Mark a strategy as unused so it can be picked again."""
+    from db.supabase_client import get_supabase
+    db = get_supabase()
+    db.table("market_strategies").update({"used": False, "used_in_post": None}).eq("id", strategy_id).execute()
+    return {"ok": True}
+
+
+@router.get("/market-strategies/thursday-check")
+async def thursday_warning_check():
+    """Check if Thursday has a non-strategy post. Used by dashboard toast."""
+    from db.queries import thursday_slot_has_non_strategy_post
+    warning = thursday_slot_has_non_strategy_post()
+    return {"ok": True, "warning": warning}
