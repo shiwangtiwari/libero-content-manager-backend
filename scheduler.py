@@ -16,6 +16,17 @@ Phase 6 hardening:
     approved→failed before touching LinkedIn API. Only one job can claim a post.
     Second job finds status='failed' and skips. On LinkedIn success → 'posted'.
     On LinkedIn failure → reverts to 'approved' so dashboard retry works.
+
+Image pre-flight check (new):
+  - When a posting job fires, it checks whether the approved post has a valid
+    image URL BEFORE claiming it and calling the LinkedIn API.
+  - "Valid" means: image_url is set AND starts with https:// (not telegram://).
+  - If image is missing or broken, Shiwang gets a Telegram warning showing
+    exactly what the image status is, so he can send an image if needed.
+  - Post still goes live at scheduled time regardless — the warning is
+    informational, not a blocker. If no image arrives, it posts as text-only.
+  - This eliminates the surprise of seeing "IMAGE: TEXT ONLY" in the [POSTED]
+    confirmation after the fact.
 """
 import asyncio
 import logging
@@ -70,11 +81,34 @@ async def _async_post_thursday():
     await _run_posting_job("Thursday 9:00 AM")
 
 
+def _image_status(post: dict) -> tuple[str, bool]:
+    """
+    Inspect a post's image_url and return (status_label, is_valid).
+
+    is_valid = True  → image will be included in the LinkedIn post
+    is_valid = False → post will go out as text-only
+
+    Status labels:
+      SUPABASE OK    → https://...supabase.co/... URL — full confidence
+      BAD URL        → starts with telegram:// — Supabase upload failed earlier
+      MISSING        → image_url is None or empty
+    """
+    url = post.get("image_url") or ""
+    if not url:
+        return "MISSING", False
+    if url.startswith("telegram://"):
+        return "BAD URL (upload failed)", False
+    if url.startswith("https://"):
+        return "SUPABASE OK", True
+    # Unexpected prefix — treat as bad
+    return f"UNKNOWN URL ({url[:30]})", False
+
+
 async def _run_posting_job(slot_label: str):
     """
     Find the approved post for this slot and publish it to LinkedIn.
 
-    Duplicate post guard (Phase 6):
+    Duplicate post guard:
     1. Fetch all approved posts due now.
     2. For each post, call claim_post_for_posting() which atomically flips
        status approved→failed. This is the "lock".
@@ -83,6 +117,12 @@ async def _run_posting_job(slot_label: str):
     5. On success: mark_post_posted() → status='posted'.
     6. On failure: revert_post_to_approved() → status='approved' again.
        This lets Shiwang retry from the dashboard.
+
+    Image pre-flight:
+    - Before claiming, check the image URL.
+    - If image is missing or bad → send Telegram warning immediately so
+      Shiwang knows before the post goes live.
+    - Post still proceeds — warning is informational only.
     """
     from db import queries
     from services.linkedin_poster import post_to_linkedin
@@ -99,6 +139,40 @@ async def _run_posting_job(slot_label: str):
     for post in due_posts:
         post_id = post["id"]
 
+        # ── Image pre-flight check ─────────────────────────────────────────
+        # Run BEFORE claiming the post so we alert Shiwang at the earliest moment.
+        img_label, img_valid = _image_status(post)
+        hook = next(
+            (l.strip() for l in (post.get("content") or "").split("\n") if l.strip()),
+            ""
+        )[:60]
+
+        if img_valid:
+            # Image is good — log only, no Telegram noise
+            logger.info(
+                "[Scheduler] Pre-flight: post %s image OK (%s)",
+                post_id[:8], img_label,
+            )
+        else:
+            # Image is missing or broken — warn Shiwang NOW before posting
+            logger.warning(
+                "[Scheduler] Pre-flight: post %s image %s — will post text-only",
+                post_id[:8], img_label,
+            )
+            await send_telegram_message(
+                f"<b>[IMAGE WARNING]</b>\n\n"
+                f"<code>SLOT       {slot_label}\n"
+                f"POST ID    {post_id[:8].upper()}\n"
+                f"IMAGE      {img_label}\n"
+                f"HOOK       {hook}...</code>\n\n"
+                f"Post has <b>no valid image</b>.\n"
+                f"It will go live as <b>text-only</b> at {slot_label}.\n\n"
+                f"To attach an image now:\n"
+                f"1. Send /generate_image {post_id[:8]}\n"
+                f"2. Generate the image and send it as a photo here\n\n"
+                f"<i>If no image is sent, text-only post will go live automatically.</i>"
+            )
+
         # ── Duplicate guard: atomic claim ──────────────────────────────────
         claimed = queries.claim_post_for_posting(post_id)
         if not claimed:
@@ -112,18 +186,33 @@ async def _run_posting_job(slot_label: str):
 
         try:
             result = await post_to_linkedin(post_id)
-            # Success — mark as posted (mark_post_posted sets status='posted')
+
+            # ── Success confirmation ───────────────────────────────────────
             post_url = f"https://www.linkedin.com/feed/update/{result['linkedin_post_id']}"
-            img_status = "WITH IMAGE" if result.get("posted_with_image") else "TEXT ONLY"
+            posted_with_image = result.get("posted_with_image", False)
+            img_status_line = "WITH IMAGE" if posted_with_image else "TEXT ONLY"
+
+            # Build confirmation message — extra detail if image was expected but dropped
+            extra = ""
+            if not posted_with_image and img_valid:
+                # We had a good URL but LinkedIn still couldn't use it
+                extra = (
+                    "\n\n<code>[WARN] Image URL was set but LinkedIn could not "
+                    "process it — posted as text-only. Check Railway logs.</code>"
+                )
+
             await send_telegram_message(
                 f"<b>[POSTED]</b>\n\n"
                 f"<code>SLOT       {slot_label}\n"
-                f"IMAGE      {img_status}\n"
+                f"IMAGE      {img_status_line}\n"
                 f"LI ID      {result['linkedin_post_id'][:20]}</code>\n\n"
-                f"View: {post_url}",
+                f"View: {post_url}"
+                + extra,
             )
-            logger.info("[Scheduler] Posted successfully: %s (image=%s)",
-                        result["linkedin_post_id"], result.get("posted_with_image"))
+            logger.info(
+                "[Scheduler] Posted successfully: %s (image=%s)",
+                result["linkedin_post_id"], posted_with_image,
+            )
 
         except Exception as e:
             # Failure — revert status to 'approved' so dashboard retry works
@@ -189,7 +278,7 @@ async def _async_generate_content():
                 result.get("post_id"), result.get("topic", "")[:50],
             )
         elif result.get("skipped"):
-            logger.info("[Scheduler] Content pipeline skipped — slot already has a draft")
+            logger.info("[Scheduler] Content pipeline skipped — all slots already have a post")
         else:
             logger.error("[Scheduler] Content pipeline failed: %s", result.get("error"))
     except Exception as e:
