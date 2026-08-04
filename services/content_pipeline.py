@@ -76,28 +76,38 @@ async def run_content_pipeline() -> dict[str, Any]:
 
         # Compute viral score
         viral_score = _compute_viral_score(post_text)
-        logger.info("Viral score: %d/100", viral_score)
+        logger.info("Viral score: %d/100 (first attempt)", viral_score)
 
-        # Step 4: Compute next posting slot + duplicate guard
-        # Check BEFORE generating if a draft already exists for the next slot.
-        # This prevents: Tue 6AM gen fires, finds Wed+Thu both occupied,
-        # skips to Tue next week instead of doing nothing.
-        from services.schedule_utils import next_available_slot
-        from db import queries as _q
-        upcoming_slot = next_available_slot()
-        existing = _q.get_posts_by_status(
-            ["draft", "approved", "scheduled", "pending_reschedule"]
-        )
-        occupied_slots = {p["scheduled_time"] for p in existing if p.get("scheduled_time")}
-        if upcoming_slot in occupied_slots:
-            logger.info(
-                "Duplicate guard: slot %s already has a post — skipping generation",
-                upcoming_slot,
+        # If score is below 70, regenerate once with an explicit quality boost instruction
+        if viral_score < 70:
+            logger.info("Score below 70 — regenerating with quality boost")
+            boost_signal = (
+                f"{trigger} | QUALITY BOOST: previous attempt scored {viral_score}/100. "
+                f"This time: stronger hook (specific tension or number in line 1), "
+                f"more personal story detail (exact situation, not generic), "
+                f"end with a genuine question the reader actually wants to answer."
             )
-            result["success"] = True
-            result["topic"] = f"skipped — {upcoming_slot} already occupied"
-            return result
-        scheduled_time = upcoming_slot
+            post_text_v2 = await generate_post(
+                topic=selection.topic,
+                last_topics=last_topics_str,
+                signal_card=boost_signal,
+            )
+            post_text_v2 = post_text_v2.replace("**", "").replace("__", "")
+            import re as _re2
+            post_text_v2 = _re2.sub(r"  +", " ", post_text_v2).strip()
+            viral_score_v2 = _compute_viral_score(post_text_v2)
+            logger.info("Viral score v2: %d/100", viral_score_v2)
+            # Use whichever version scored higher
+            if viral_score_v2 > viral_score:
+                post_text = post_text_v2
+                viral_score = viral_score_v2
+                logger.info("Using v2 post (higher score)")
+            else:
+                logger.info("Keeping v1 post (v2 didn't improve)")
+
+        # Step 4: Compute next posting slot
+        from services.schedule_utils import next_available_slot
+        scheduled_time = next_available_slot()
         logger.info("Next posting slot: %s IST", scheduled_time)
 
         # Step 5: Save to Supabase
@@ -229,53 +239,84 @@ async def _send_draft_notification(
 
 def _compute_viral_score(post_text: str) -> int:
     """
-    Score 0-100 across 5 dimensions (0-10 each + up to 50 base).
+    Score 0-100 across 5 dimensions (20 points each).
+
+    Intentionally does NOT penalise non-PM topics — a Gaming or Anime
+    post can score just as high as a PM frameworks post if it has
+    good structure, personal voice, specificity, and a strong CTA.
     """
     import re
     score = 0
     lines = post_text.strip().split("\n")
     first_line = lines[0].strip() if lines else ""
-    last_line = lines[-1].strip() if lines else ""
-
-    # 1. Hook (0-10)
-    if first_line.endswith("?"):
-        score += 9
-    elif re.search(r"\d", first_line):
-        score += 8
-    elif len(first_line) < 80 and first_line:
-        score += 6
-    else:
-        score += 3
-
-    # 2. Personal POV (0-10)
-    personal = len(re.findall(r"\b(I|my|me|I've|I'm|I was|I learned)\b", post_text, re.I))
-    score += min(10, personal * 2)
-
-    # 3. Specificity (0-10)
-    numbers = len(re.findall(r"\d+", post_text))
-    score += min(10, numbers * 2)
-
-    # 4. Engagement CTA (0-10)
-    # Check last non-hashtag, non-empty line (hashtag lines are common at end)
     content_lines = [l.strip() for l in lines if l.strip() and not l.strip().startswith("#")]
-    cta_line = content_lines[-1] if content_lines else last_line
+    cta_line = content_lines[-1] if content_lines else ""
+
+    # 1. Hook strength (0-20)
+    # Short, specific, surprising, or asks a question
+    if first_line.endswith("?"):
+        score += 18
+    elif re.search(r"\d+", first_line):
+        score += 16   # has a number in hook
+    elif re.search(r"^(nobody|most|stop|why|the truth|unpopular|here|what)", first_line, re.I):
+        score += 15   # strong opening word
+    elif len(first_line) < 80:
+        score += 11
+    else:
+        score += 5
+
+    # 2. Personal voice (0-20)
+    # "I" statements with specific details are the highest trust signal
+    personal = len(re.findall(r"\b(I |I'|my |me |I was|I learned|I built|I spent|I killed|I made)\b",
+                              post_text, re.I))
+    specific_time = bool(re.search(
+        r"\b(last week|last month|yesterday|4 years|6 months|\d+ days|\d+ weeks|\d+ months)\b",
+        post_text, re.I
+    ))
+    score += min(20, personal * 3 + (5 if specific_time else 0))
+
+    # 3. Specificity — concrete details, numbers, named things (0-20)
+    numbers = len(re.findall(r"\d+", post_text))
+    named = len(re.findall(
+        r"\b(LinkedIn|GTA|PlayStation|Solo Leveling|Netflix|Spotify|Figma|Notion|"
+        r"Slack|Railway|Supabase|Claude|ChatGPT|India|Mumbai|Bangalore|"
+        r"PM|API|OKR|PRD|UX|MVP|SaaS|startup|Libero)\b",
+        post_text, re.I
+    ))
+    score += min(20, numbers * 2 + named * 2)
+
+    # 4. Engagement CTA (0-20)
     if cta_line.endswith("?"):
-        score += 10
-    elif re.search(r"(what|how|do you|have you|comment|tell me|share|thoughts)", cta_line, re.I):
-        score += 7
+        # Real question vs generic "Thoughts?"
+        if re.search(r"\b(what|how|when|which|have you|do you|what would|tell me)\b", cta_line, re.I):
+            score += 20
+        else:
+            score += 13
+    elif re.search(r"(comment|share|tell me|drop|thoughts|agree|disagree)", cta_line, re.I):
+        score += 8
     else:
         score += 2
 
-    # 5. Niche relevance (0-10)
-    niche_hits = len(re.findall(
-        r"\b(product|pm|manager|developer|engineer|ai|nextleap|linkedin|startup|india|career|transition)\b",
-        post_text, re.I
-    ))
-    score += min(10, niche_hits)
+    # 5. Content quality signals (0-20)
+    word_count = len(post_text.split())
+    # LinkedIn sweet spot: 150-250 words
+    if 150 <= word_count <= 250:
+        score += 8
+    elif 100 <= word_count < 150 or 250 < word_count <= 300:
+        score += 5
+    else:
+        score += 2
+    # Paragraph breaks (white space = readable)
+    para_breaks = post_text.count("\n\n")
+    score += min(7, para_breaks * 2)
+    # Hashtags present (max 3)
+    hashtags = len(re.findall(r"#\w+", post_text))
+    if 1 <= hashtags <= 3:
+        score += 5
+    elif hashtags > 3:
+        score += 1
 
-    # Each dimension is 0-10, 5 dimensions = 50 max raw.
-    # Multiply by 2 to map to 0-100 range as stored in Supabase posts.viral_score
-    return min(100, score * 2)
+    return min(100, score)
 
 
 # ---------------------------------------------------------------------------
