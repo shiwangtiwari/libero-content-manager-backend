@@ -9,6 +9,13 @@ Aesthetic: system terminal style. Bracketed markers instead of emojis.
 LIBERO is the system name — not "Claude". Session health shows LIBERO, not CLAUDE.
 
 _pending_image_post_id is stored in Supabase user_profile table (survives restarts).
+
+Fix (2026-08-04):
+  - /reject and /approve now resolve queue numbers against ALL queue statuses
+    (draft, approved, scheduled, pending_reschedule) so /reject 2 works even
+    when post 1 or 3 are already approved.
+  - /queue numbering and _resolve_post_id now use the same full status list,
+    so the numbers always match what the user sees.
 """
 import asyncio
 import logging
@@ -119,8 +126,13 @@ async def handle_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 # ── Command: /queue ───────────────────────────────────────────────────────────
 
+# The FULL set of statuses the queue shows. Used by both /queue display
+# and _resolve_post_id so numbers always match.
+_QUEUE_STATUSES = ["draft", "approved", "scheduled", "pending_reschedule"]
+
+
 async def handle_queue(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    posts = queries.get_posts_by_status(["draft", "approved", "scheduled", "pending_reschedule"])
+    posts = queries.get_posts_by_status(_QUEUE_STATUSES)
     if not posts:
         await update.message.reply_text(
             "<b>QUEUE EMPTY</b>\n\n"
@@ -137,7 +149,7 @@ async def handle_queue(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "scheduled": "SCHEDULED", "pending_reschedule": "RESCHEDULED",
     }
     lines = ["<b>QUEUE</b>\n"]
-    # Sort newest first (matches /queue numbering for /reject 1, /reject 2 etc.)
+    # Sort newest first — this defines the numbering for /reject 1, /reject 2 etc.
     posts_sorted = sorted(posts[:5], key=lambda p: p.get("created_at", ""), reverse=True)
     for i, p in enumerate(posts_sorted, 1):
         sl = status_label.get(p["status"], p["status"].upper())
@@ -151,19 +163,26 @@ async def handle_queue(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
 
-# ── Command: /approve ─────────────────────────────────────────────────────────
-
+# ── _resolve_post_id ──────────────────────────────────────────────────────────
 
 def _resolve_post_id(arg: str, statuses: list[str]) -> tuple[str | None, str | None]:
     """
     Resolve a user-supplied argument to a full post ID.
+
+    IMPORTANT: Always queries against _QUEUE_STATUSES (all queue posts) so that
+    the position numbers shown in /queue match /reject N and /approve N.
+
+    The `statuses` parameter is kept for API compatibility but is no longer used
+    as the search scope — we always search the full queue so numbering is stable.
+
     Accepts:
       - A queue number: "1", "2", "3"  (from /queue output)
       - A short ID:    "0bab32a5"      (first 8 chars shown in /queue)
       - A full UUID:   "0bab32a5-..."  (full ID)
     Returns (full_post_id, error_message).
     """
-    posts = queries.get_posts_by_status(statuses)
+    # Always load the full queue — same scope as /queue display
+    posts = queries.get_posts_by_status(_QUEUE_STATUSES)
     if not posts:
         return None, "No posts found in queue."
 
@@ -185,21 +204,26 @@ def _resolve_post_id(arg: str, statuses: list[str]) -> tuple[str | None, str | N
 
     return None, f"No post found matching '{arg}'. Use /queue to see IDs."
 
+
+# ── Command: /approve ─────────────────────────────────────────────────────────
+
 async def handle_approve(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Usage: /approve  or  /approve <number_or_id>
     /approve       — approves the most recent draft
     /approve 1     — approves queue item #1
     /approve 2     — approves queue item #2
     /approve 0bab32 — approves by short ID"""
-    statuses = ["draft", "pending_reschedule"]
+
     if not context.args:
-        drafts = queries.get_posts_by_status(statuses)
+        # No argument — approve the most recent approvable post (draft/pending)
+        drafts = queries.get_posts_by_status(["draft", "pending_reschedule"])
         if not drafts:
             await update.message.reply_text("[ERROR] No draft posts to approve.")
             return
         post_id = drafts[0]["id"]
     else:
-        post_id, err = _resolve_post_id(context.args[0], statuses)
+        # Resolve against full queue (so /approve 2 works even if post 1 is approved)
+        post_id, err = _resolve_post_id(context.args[0], _QUEUE_STATUSES)
         if err:
             await update.message.reply_text(f"[ERROR] {err}")
             return
@@ -226,18 +250,20 @@ async def handle_approve(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 async def handle_reject(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Usage: /reject  or  /reject <number_or_id>
     /reject       — rejects the most recent draft
-    /reject 1     — rejects queue item #1
+    /reject 1     — rejects queue item #1  (draft OR approved)
     /reject 2     — rejects queue item #2
     /reject 0bab32 — rejects by short ID"""
-    statuses = ["draft", "pending_reschedule"]
+
     if not context.args:
-        drafts = queries.get_posts_by_status(statuses)
+        # No argument — reject the most recent draft/pending
+        drafts = queries.get_posts_by_status(["draft", "pending_reschedule"])
         if not drafts:
             await update.message.reply_text("[ERROR] No draft posts to reject.")
             return
         post_id = drafts[0]["id"]
     else:
-        post_id, err = _resolve_post_id(context.args[0], statuses)
+        # Resolve against full queue — /reject 2 works even if post 1 is approved
+        post_id, err = _resolve_post_id(context.args[0], _QUEUE_STATUSES)
         if err:
             await update.message.reply_text(f"[ERROR] {err}")
             return
@@ -282,15 +308,14 @@ async def handle_reject(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 async def handle_reschedule(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Usage: /reschedule  or  /reschedule <number_or_id>"""
-    statuses = ["approved", "scheduled", "pending_reschedule", "draft"]
     if not context.args:
-        posts = queries.get_posts_by_status(statuses)
+        posts = queries.get_posts_by_status(_QUEUE_STATUSES)
         if not posts:
             await update.message.reply_text("[ERROR] No posts to reschedule.")
             return
         post_id = posts[0]["id"]
     else:
-        post_id, err = _resolve_post_id(context.args[0], statuses)
+        post_id, err = _resolve_post_id(context.args[0], _QUEUE_STATUSES)
         if err:
             await update.message.reply_text(f"[ERROR] {err}")
             return
