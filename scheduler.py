@@ -60,6 +60,30 @@ def job_check_missed_approvals():
 def job_check_session_health():
     asyncio.run(_async_session_health())
 
+
+def job_thursday_strategy_warning():
+    asyncio.run(_async_thursday_strategy_warning())
+
+
+async def _async_thursday_strategy_warning():
+    """Tuesday 10AM: warn if Thursday slot is occupied by a non-strategy post."""
+    try:
+        from db.queries import thursday_slot_has_non_strategy_post
+        from routers.telegram import send_telegram_message
+        if thursday_slot_has_non_strategy_post():
+            await send_telegram_message(
+                "<b>[MARKET STRATEGY DAY WARNING]</b>\n\n"
+                "Thursday is Market Strategy Day.\n"
+                "A non-strategy post is currently approved for Thursday.\n\n"
+                "<code>What do you want to do?</code>\n\n"
+                "1. Keep the current post for Thursday\n"
+                "2. Push it to the next slot and let the system generate a Market Strategy post for Thursday (use /schedule_next)\n\n"
+                "A Market Strategy draft will auto-generate Wednesday 6AM regardless."
+            )
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning("Thursday warning job failed: %s", e)
+
 def job_generate_content():
     asyncio.run(_async_generate_content())
 
@@ -413,6 +437,15 @@ def start_scheduler():
         CronTrigger(day_of_week="wed", hour=6, minute=0, timezone=IST),
         id="generate_wednesday",
         name="Generate content for Thursday post",
+        replace_existing=True,
+        misfire_grace_time=3600,
+    )
+    # Tuesday 10AM IST: warn if Thursday slot has a non-strategy post approved
+    scheduler.add_job(
+        job_thursday_strategy_warning,
+        CronTrigger(day_of_week="tue", hour=10, minute=0, timezone=IST),
+        id="thursday_strategy_warning",
+        name="Thursday Market Strategy Day warning",
         replace_existing=True,
         misfire_grace_time=3600,
     )
