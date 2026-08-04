@@ -2,6 +2,17 @@
 LinkedIn posting service.
 Implements the full image upload + asset availability retry loop + UGC post creation.
 This is the only place that touches LinkedIn API. Called by scheduler.py at posting time.
+
+Fix (2026-08-04):
+  - Asset availability retry loop: was 10 × 2s = 20 seconds. Extended to 30 × 3s = 90 seconds.
+    LinkedIn documentation says assets can take up to 60 seconds to reach AVAILABLE status.
+    The old 20-second limit was the direct cause of the post going out as text-only today.
+  - Status field parsing made robust: LinkedIn's asset API can return status either at
+    the top level (status_data["status"]) or nested inside recipes[0]["status"].
+    We now check both so a format variation doesn't cause a false timeout.
+  - httpx client timeout raised from 60s to 120s to accommodate the longer wait.
+  - Image download uses a separate short-timeout client so a slow Supabase response
+    doesn't eat into the LinkedIn API budget.
 """
 import asyncio
 import logging
@@ -15,14 +26,16 @@ logger = logging.getLogger(__name__)
 
 LINKEDIN_API = "https://api.linkedin.com/v2"
 
+# How long to wait for LinkedIn to process the uploaded image asset.
+# LinkedIn docs say up to 60s; we wait 90s to be safe (30 attempts × 3s).
+_ASSET_POLL_ATTEMPTS = 30
+_ASSET_POLL_INTERVAL = 3   # seconds between each status check
+
 
 async def post_to_linkedin(post_id: str) -> dict:
     """
     Full posting flow for a post record from Supabase.
-    Returns {"success": True, "linkedin_post_id": "..."} or raises.
-
-    Phase 6: 401 responses send a Telegram alert with renewal instructions
-    before raising, so Shiwang knows immediately why the post failed.
+    Returns {"success": True, "linkedin_post_id": "...", "posted_with_image": bool} or raises.
     """
     post = queries.get_post_by_id(post_id)
     if not post:
@@ -38,8 +51,7 @@ async def post_to_linkedin(post_id: str) -> dict:
     }
     person_urn = settings.LINKEDIN_PERSON_URN
 
-    # Phase 6: quick token check before attempting the full flow.
-    # Avoids uploading the image only to fail at the post step.
+    # Quick token check before attempting the full flow.
     token_ok = await _check_token(headers)
     if not token_ok:
         await _alert_token_expired()
@@ -50,9 +62,10 @@ async def post_to_linkedin(post_id: str) -> dict:
         )
 
     posted_with_image = False
+    # Use a longer timeout to accommodate the 90-second asset availability wait
     try:
-        async with httpx.AsyncClient(timeout=60) as client:
-            if image_url:
+        async with httpx.AsyncClient(timeout=120) as client:
+            if image_url and image_url.startswith("https://"):
                 try:
                     asset_urn = await _upload_image(client, headers, person_urn, image_url)
                     linkedin_post_id = await _create_ugc_post_with_image(
@@ -60,16 +73,15 @@ async def post_to_linkedin(post_id: str) -> dict:
                     )
                     posted_with_image = True
                 except TimeoutError as te:
-                    # Image asset never became AVAILABLE — fall back to text only
                     logger.warning(
-                        "[linkedin_poster] Image availability timeout — posting text-only: %s", te
+                        "[linkedin_poster] Image availability timeout after %ds — posting text-only: %s",
+                        _ASSET_POLL_ATTEMPTS * _ASSET_POLL_INTERVAL, te,
                     )
                     await _alert_image_fallback(str(te))
                     linkedin_post_id = await _create_ugc_post_text_only(
                         client, headers, person_urn, content
                     )
                 except (httpx.HTTPStatusError, httpx.RequestError) as img_err:
-                    # Image download or upload failed — fall back to text only
                     logger.warning(
                         "[linkedin_poster] Image upload failed — posting text-only: %s", img_err
                     )
@@ -78,6 +90,12 @@ async def post_to_linkedin(post_id: str) -> dict:
                         client, headers, person_urn, content
                     )
             else:
+                # No image or bad URL (telegram://) — post text-only directly
+                if image_url and not image_url.startswith("https://"):
+                    logger.warning(
+                        "[linkedin_poster] image_url is not a valid https URL (%s) — text-only",
+                        image_url[:40],
+                    )
                 linkedin_post_id = await _create_ugc_post_text_only(
                     client, headers, person_urn, content
                 )
@@ -88,7 +106,7 @@ async def post_to_linkedin(post_id: str) -> dict:
                 "LinkedIn 401 during posting — token expired. "
                 "Renew following Section 8 of master doc."
             ) from e
-        raise  # Re-raise other HTTP errors unchanged
+        raise
 
     ist = pytz.timezone("Asia/Kolkata")
     posted_time = datetime.now(ist).isoformat()
@@ -102,10 +120,7 @@ async def post_to_linkedin(post_id: str) -> dict:
 
 
 async def _alert_image_fallback(reason: str) -> None:
-    """
-    Notify Shiwang that the image failed and the post went out as text-only.
-    Post still goes live — this is informational only.
-    """
+    """Notify Shiwang that the image failed and the post went out as text-only."""
     import os
     bot_token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
     chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
@@ -113,9 +128,8 @@ async def _alert_image_fallback(reason: str) -> None:
         return
     message = (
         f"<b>[IMAGE FAILED — TEXT ONLY]</b>\n\n"
-        f"<code>REASON  {reason[:150]}</code>\n\n"
-        f"Post went live as text-only. "
-        f"The image was not attached. Check Supabase Storage if the URL was set."
+        f"<code>REASON  {reason[:200]}</code>\n\n"
+        f"Post went live as text-only. The image was not attached."
     )
     try:
         async with httpx.AsyncClient(timeout=10) as client:
@@ -131,15 +145,11 @@ async def _check_token(headers: dict) -> bool:
     """Quick LinkedIn token validity check. Returns True if valid."""
     try:
         async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.get(
-                f"{LINKEDIN_API}/userinfo",
-                headers=headers,
-            )
+            resp = await client.get(f"{LINKEDIN_API}/userinfo", headers=headers)
             return resp.status_code == 200
     except Exception as e:
-        # Network error — let the main flow proceed rather than block posting
-        logger.warning(f"[linkedin_poster] Token check request failed: {e}")
-        return True
+        logger.warning("[linkedin_poster] Token check request failed (proceeding anyway): %s", e)
+        return True  # Network error — let the main flow proceed
 
 
 async def _alert_token_expired() -> None:
@@ -150,7 +160,7 @@ async def _alert_token_expired() -> None:
     if not bot_token or not chat_id:
         return
     message = (
-        "🔴 <b>LinkedIn token expired — post NOT sent</b>\n\n"
+        "<b>[LINKEDIN TOKEN EXPIRED]</b>\n\n"
         "Your LinkedIn access token has hit the 60-day limit.\n\n"
         "<b>To renew (~10 minutes):</b>\n"
         "1. Open your Railway service → Variables tab\n"
@@ -167,14 +177,56 @@ async def _alert_token_expired() -> None:
                 json={"chat_id": chat_id, "text": message, "parse_mode": "HTML"},
             )
     except Exception as e:
-        logger.error(f"[linkedin_poster] Token expiry alert failed to send: {e}")
+        logger.error("[linkedin_poster] Token expiry alert failed to send: %s", e)
+
+
+def _parse_asset_status(status_data: dict) -> str:
+    """
+    Extract the asset processing status from LinkedIn's asset API response.
+
+    LinkedIn can return the status in two places depending on API version:
+      1. Top-level:  status_data["status"]  → "AVAILABLE" | "PROCESSING" | "WAITING_UPLOAD"
+      2. Nested:     status_data["recipes"][0]["status"]
+
+    We check both so a response format variation doesn't cause a false timeout.
+    Returns the status string, or empty string if not found.
+    """
+    # Top-level status field (most common)
+    top = status_data.get("status", "")
+    if top:
+        return top
+
+    # Nested inside recipes array
+    recipes = status_data.get("recipes", [])
+    if recipes and isinstance(recipes, list):
+        nested = recipes[0].get("status", "")
+        if nested:
+            return nested
+
+    # Some responses wrap everything in a "value" key
+    value = status_data.get("value", {})
+    if isinstance(value, dict):
+        val_status = value.get("status", "")
+        if val_status:
+            return val_status
+        val_recipes = value.get("recipes", [])
+        if val_recipes and isinstance(val_recipes, list):
+            return val_recipes[0].get("status", "")
+
+    return ""
 
 
 async def _upload_image(client: httpx.AsyncClient, headers: dict,
                         person_urn: str, image_url: str) -> str:
-    """Register + upload image, wait for AVAILABLE, return asset URN."""
+    """
+    Register + upload image to LinkedIn, wait for AVAILABLE, return asset URN.
 
-    # Step 1: Register upload
+    Retry loop: _ASSET_POLL_ATTEMPTS × _ASSET_POLL_INTERVAL seconds.
+    Default: 30 × 3s = 90 seconds total wait.
+    LinkedIn docs say assets take up to 60s; 90s gives a comfortable buffer.
+    """
+
+    # Step 1: Register the upload slot with LinkedIn
     register_resp = await client.post(
         f"{LINKEDIN_API}/assets?action=registerUpload",
         headers=headers,
@@ -197,37 +249,86 @@ async def _upload_image(client: httpx.AsyncClient, headers: dict,
         ["com.linkedin.digitalmedia.uploading.MediaUploadHttpRequest"]["uploadUrl"]
     )
     asset_urn = register_data["value"]["asset"]
+    logger.info("[linkedin_poster] Asset URN: %s", asset_urn)
 
-    # Step 2: Download local image bytes then upload to LinkedIn
-    img_resp = await client.get(image_url)
-    img_resp.raise_for_status()
-    image_bytes = img_resp.content
+    # Step 2: Download image from Supabase Storage, then upload to LinkedIn
+    # Use a separate short-timeout client for the download so it doesn't
+    # eat into the LinkedIn API budget.
+    async with httpx.AsyncClient(timeout=30) as dl_client:
+        img_resp = await dl_client.get(image_url)
+        img_resp.raise_for_status()
+        image_bytes = img_resp.content
+
+    logger.info(
+        "[linkedin_poster] Downloaded image: %d bytes from %s",
+        len(image_bytes), image_url[:60],
+    )
+
+    # Detect content type from the URL — LinkedIn accepts JPEG and PNG
+    content_type = "image/jpeg" if image_url.lower().endswith(".jpg") or "jpeg" in image_url.lower() else "image/png"
 
     upload_resp = await client.put(
         upload_url,
         content=image_bytes,
         headers={
             "Authorization": f"Bearer {settings.LINKEDIN_ACCESS_TOKEN}",
-            "Content-Type": "image/png",
+            "Content-Type": content_type,
         },
     )
     upload_resp.raise_for_status()
+    logger.info("[linkedin_poster] Image uploaded to LinkedIn. Waiting for AVAILABLE status...")
 
-    # Step 3: Retry loop — wait for AVAILABLE status (critical, 2s × 10 attempts)
+    # Step 3: Poll for AVAILABLE status
+    # 30 attempts × 3 seconds = 90 seconds maximum wait
     asset_id = asset_urn.split(":")[-1]
-    for attempt in range(10):
-        await asyncio.sleep(2)
-        status_resp = await client.get(
-            f"{LINKEDIN_API}/assets/{asset_id}",
-            headers=headers,
-        )
+    last_status = "UNKNOWN"
+
+    for attempt in range(_ASSET_POLL_ATTEMPTS):
+        await asyncio.sleep(_ASSET_POLL_INTERVAL)
+
+        try:
+            status_resp = await client.get(
+                f"{LINKEDIN_API}/assets/{asset_id}",
+                headers=headers,
+            )
+        except httpx.RequestError as e:
+            logger.warning("[linkedin_poster] Asset status check failed (attempt %d): %s", attempt + 1, e)
+            continue
+
         if status_resp.status_code == 200:
             status_data = status_resp.json()
-            if status_data.get("status") == "AVAILABLE":
-                return asset_urn
-        # Keep retrying
+            current_status = _parse_asset_status(status_data)
+            last_status = current_status or last_status
 
-    raise TimeoutError(f"LinkedIn image asset {asset_id} did not reach AVAILABLE status after 20 seconds")
+            logger.debug(
+                "[linkedin_poster] Asset status attempt %d/%d: %s",
+                attempt + 1, _ASSET_POLL_ATTEMPTS, current_status,
+            )
+
+            if current_status == "AVAILABLE":
+                logger.info(
+                    "[linkedin_poster] Asset AVAILABLE after %ds",
+                    (attempt + 1) * _ASSET_POLL_INTERVAL,
+                )
+                return asset_urn
+
+            if current_status == "FAILED":
+                raise RuntimeError(
+                    f"LinkedIn image asset processing FAILED (asset: {asset_id}). "
+                    f"Try generating a new image and sending it before approving."
+                )
+        else:
+            logger.warning(
+                "[linkedin_poster] Asset status check returned %d (attempt %d)",
+                status_resp.status_code, attempt + 1,
+            )
+
+    total_wait = _ASSET_POLL_ATTEMPTS * _ASSET_POLL_INTERVAL
+    raise TimeoutError(
+        f"LinkedIn image asset {asset_id} did not reach AVAILABLE status after "
+        f"{total_wait}s (last status: {last_status}). "
+        f"Post will go out as text-only."
+    )
 
 
 async def _create_ugc_post_with_image(client: httpx.AsyncClient, headers: dict,
