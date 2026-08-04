@@ -86,6 +86,11 @@ class SignalBundle:
     # Used to enforce MIN_CATEGORY_GAP_POSTS.
     recent_category_sequence: list[str] = field(default_factory=list)
 
+    # Exact topic strings already used in queued posts (from signal_card.selected_topic
+    # and signal_card.trigger). Hard-blocks the exact same topic being picked twice
+    # even when category detection fails (e.g. GTA6 categorised as General).
+    queued_topic_set: set[str] = field(default_factory=set)
+
 
 # ---------------------------------------------------------------------------
 # Gap analysis helpers
@@ -277,6 +282,25 @@ async def collect_all_signals() -> SignalBundle:
             for ct in queued_covered
             if ct.primary_category and ct.primary_category != "General"
         }
+
+        # Build queued_topic_set: exact topic/trigger strings from queued posts.
+        # Catches cases where category block fails (GTA6 = General, not blocked)
+        # but the topic itself is the same. Also catches same signal being picked
+        # repeatedly because mark_signal_used was never called.
+        queued_topic_strings: set[str] = set()
+        for qpost in queued_posts:
+            sc = qpost.get("signal_card") or {}
+            for key in ("selected_topic", "trigger"):
+                val = sc.get(key, "")
+                if val:
+                    queued_topic_strings.add(val.lower().strip()[:80])
+            first_line = next(
+                (ln.strip() for ln in (qpost.get("content") or "").split("\n") if ln.strip()),
+                ""
+            )
+            if first_line:
+                queued_topic_strings.add(first_line.lower()[:60])
+        bundle.queued_topic_set = queued_topic_strings
 
         # recent_category_sequence: the ordered list of categories from recent posts
         # (queued newest-first, then posted newest-first) for the gap window check.
