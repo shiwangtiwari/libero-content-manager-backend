@@ -233,10 +233,19 @@ VOICE — Shiwang's actual style:
 
 FORMAT RULES:
 - 180-240 words total
-- Line breaks between every paragraph
-- No bold, no bullet points, no em dashes
-- No "I'm excited to share", "Great question", "In conclusion"
-- No fabricated statistics
+- Line breaks between every paragraph (single blank line between each)
+- No bold, no bullet points, no numbered lists
+- NO em dashes (—) anywhere. Use a period, a comma, or a new sentence instead.
+- NO AI filler phrases. Hard banned:
+  "I'm excited to share", "Great question", "In conclusion", "It's worth noting",
+  "Diving deep", "Let's unpack", "Game-changer", "Leverage" (as a verb),
+  "Paradigm shift", "Unlock", "Holistic", "Synergy", "Actionable insights",
+  "At the end of the day", "Think about it", "The thing is",
+  "More importantly", "To be honest", "I've been reflecting",
+  "As someone who", "In today's world", "In my journey"
+- No fabricated statistics or made-up numbers (only use real numbers you'd actually know)
+- Never start a sentence with "But" or "And" as a cheap connector
+- Write like a sharp 26-year-old texting a smart friend, not a LinkedIn influencer
 
 HASHTAGS (at the very end, on their own line):
 - Maximum 3 hashtags
@@ -444,3 +453,137 @@ async def validate_api_key() -> dict:
     except Exception as e:
         result["error"] = str(e)
     return result
+
+
+# ── Market Strategy post generator ───────────────────────────────────────────
+
+def build_market_strategy_prompt(
+    strategy: dict,
+    trending_context: str = "",
+    used_trending_refs: list[str] | None = None,
+) -> str:
+    """
+    Prompt for Thursday Market Strategy posts.
+    Personal voice, storytelling, wow factor, trending hook.
+    """
+    used_refs = used_trending_refs or []
+    title = strategy.get("title", "")
+    company = strategy.get("company", "")
+    the_story = strategy.get("the_story", "")
+    the_rule = strategy.get("the_rule", "")
+    how_to_use = strategy.get("how_to_use", "")
+    wow_factor = strategy.get("wow_factor", "")
+    strategy_name = strategy.get("strategy_name", "")
+    industry = strategy.get("industry", "")
+
+    if trending_context:
+        blocked = "\n".join(f"  AVOID (used before): {r}" for r in used_refs[:5])
+        trending_block = f"""
+TRENDING CONTEXT (pick ONE if it connects naturally):
+{trending_context}
+{("\nAlready-used references:\n" + blocked) if used_refs else ""}
+"""
+    else:
+        trending_block = ""
+
+    return f"""You are writing a Thursday Market Strategy LinkedIn post for Shiwang, a developer transitioning to PM.
+
+Every Thursday Shiwang shares one real story about how a real company used a specific strategy to win. It is not a textbook. It is a story told like he just discovered it.
+
+THE STRATEGY:
+Company: {company}
+Strategy name: {strategy_name}
+Industry: {industry}
+Story: {the_story}
+Rule: {the_rule}
+How to use it: {how_to_use}
+Wow factor: {wow_factor}
+{trending_block}
+HOW TO WRITE:
+
+LINE 1 HOOK (choose one approach):
+A. Start with a trending reference that leads into the story naturally.
+B. Start with the wildest fact from the story. Make it feel like a secret.
+C. Start with a relatable tension that sets up why this strategy matters.
+Never start with "Today I learned", "Here is a story", or "In [year]".
+
+BODY (3-5 short paragraphs):
+- Tell the story like you just found it and cannot believe it worked.
+- Name the company. Name specific numbers. Name the outcome.
+- Then: what is the rule behind it? One sentence, plain language.
+- Then: how can a PM or founder use this right now? One concrete thing.
+
+CLOSE:
+- End with a question that makes the reader think about their own product.
+- Or end with a punchy line that lands like the end of a good story.
+- Never: "What do you think? Drop a comment!"
+
+ABSOLUTE RULES:
+- No em dashes anywhere. Use periods or commas.
+- No "it is worth noting", "game changer", "leverage" as a verb, "paradigm shift".
+- Easy vocabulary. Sounds like a smart 25-year-old, not a consultant.
+- Only use numbers that appear in the story above. No fabricated stats.
+- 200-260 words total. Line break between every paragraph.
+- No bullet points, no bold text, no numbered lists.
+- End with 2-3 hashtags: #ProductStrategy #MarketingStrategy and one relevant one.
+
+Write the post only. No preamble. No "Here is a draft". Just the post.
+"""
+
+
+async def generate_market_strategy_post(
+    strategy: dict,
+    used_trending_refs: list[str] | None = None,
+) -> tuple[str, str]:
+    """
+    Generate a Thursday Market Strategy post.
+    Returns (post_text, trending_ref_used).
+    """
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+    if not api_key:
+        raise EnvironmentError("ANTHROPIC_API_KEY not set")
+
+    trending_context = ""
+    try:
+        trending_context = await _fetch_trending_context(strategy.get("title", ""))
+    except Exception as e:
+        logger.debug("[market_strategy] Trending fetch failed (non-fatal): %s", e)
+
+    prompt = build_market_strategy_prompt(
+        strategy=strategy,
+        trending_context=trending_context,
+        used_trending_refs=used_trending_refs or [],
+    )
+
+    logger.info("[market_strategy] Generating for: %s / %s", strategy.get("company"), strategy.get("strategy_name"))
+
+    async with httpx.AsyncClient(timeout=60) as client:
+        response = await client.post(
+            ANTHROPIC_API_URL,
+            headers={
+                "x-api-key": api_key,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json={
+                "model": MODEL,
+                "max_tokens": MAX_TOKENS,
+                "messages": [{"role": "user", "content": prompt}],
+            },
+        )
+
+    if response.status_code != 200:
+        raise RuntimeError(f"Anthropic API {response.status_code}: {response.text[:200]}")
+
+    data = response.json()
+    content = data["content"][0]["text"].strip()
+
+    # Try to extract the trending reference used for deduplication
+    trending_ref = ""
+    if trending_context:
+        import re as _re
+        match = _re.search(r'"([^"]{10,80})"', content)
+        if match:
+            trending_ref = match.group(1)
+
+    return content, trending_ref
