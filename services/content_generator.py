@@ -477,12 +477,14 @@ def build_market_strategy_prompt(
     industry = strategy.get("industry", "")
 
     if trending_context:
-        blocked = "\n".join(f"  AVOID (used before): {r}" for r in used_refs[:5])
-        trending_block = f"""
-TRENDING CONTEXT (pick ONE if it connects naturally):
-{trending_context}
-{("\nAlready-used references:\n" + blocked) if used_refs else ""}
-"""
+        blocked_lines = "\n".join(f"  AVOID (used before): {r}" for r in used_refs[:5])
+        already_used_block = ("\nAlready-used references:\n" + blocked_lines) if used_refs else ""
+        trending_block = (
+            "\nTRENDING CONTEXT (pick ONE if it connects naturally):\n"
+            + trending_context
+            + already_used_block
+            + "\n"
+        )
     else:
         trending_block = ""
 
