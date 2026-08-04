@@ -185,11 +185,26 @@ def create_signal(source: str, topic: str, raw_data: dict) -> dict:
     return result.data[0]
 
 
-def get_unused_signals(source: Optional[str] = None) -> list[dict]:
+def get_unused_signals(source: Optional[str] = None, max_age_hours: int = 24) -> list[dict]:
+    """
+    Return unused signals, optionally filtered by source.
+
+    max_age_hours: only return signals created within this many hours.
+    Default 24h prevents stale cached LinkedIn topics from being served forever.
+    Without this, the same scraped topics from days ago appeared on every run
+    because mark_signal_used() was never called anywhere.
+    Set max_age_hours=0 to disable the cutoff.
+    """
+    from datetime import datetime, timedelta
+    import pytz
     db = get_supabase()
     query = db.table("content_signals").select("*").eq("used", False)
     if source:
         query = query.eq("source", source)
+    if max_age_hours > 0:
+        ist = pytz.timezone("Asia/Kolkata")
+        cutoff = (datetime.now(ist) - timedelta(hours=max_age_hours)).isoformat()
+        query = query.gte("created_at", cutoff)
     result = query.order("created_at", desc=True).execute()
     return result.data or []
 
