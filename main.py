@@ -73,6 +73,7 @@ async def lifespan(app: FastAPI):
                     {"command": "queue",          "description": "View all pending posts and slots"},
                     {"command": "status",         "description": "System health and next scheduled post"},
                     {"command": "run_now",        "description": "Trigger content generation now"},
+                    {"command": "post_now",      "description": "Force-post approved post to LinkedIn now"},
                     {"command": "check_image",   "description": "Verify image status for queued posts"},
                 ]
                 async with _httpx.AsyncClient(timeout=10) as _hc:
