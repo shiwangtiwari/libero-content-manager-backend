@@ -60,6 +60,27 @@ async def run_content_pipeline(run_now: bool = False) -> dict[str, Any]:
     try:
         logger.info("=== Content pipeline starting (run_now=%s) ===", run_now)
 
+        # ── Step 0: Check if this is for a Thursday slot (Market Strategy day) ─
+        # If the next available slot is a Thursday, generate a Market Strategy post
+        # instead of a regular post.
+        is_thursday_slot = False
+        try:
+            from services.schedule_utils import next_available_slot as _peek_slot
+            import pytz as _pytz
+            from datetime import datetime as _dt
+            _IST = _pytz.timezone("Asia/Kolkata")
+            _peek = _peek_slot()
+            _peek_dt = _IST.localize(_dt.strptime(_peek, "%Y-%m-%d %H:%M"))
+            is_thursday_slot = (_peek_dt.weekday() == 3)  # 3 = Thursday
+            logger.info("[pipeline] Next slot: %s (Thursday: %s)", _peek, is_thursday_slot)
+        except Exception as _e:
+            logger.debug("[pipeline] Thursday check failed (non-fatal): %s", _e)
+
+        # If Thursday slot, run the Market Strategy pipeline instead
+        if is_thursday_slot and not run_now:
+            from services.content_pipeline import _run_market_strategy_pipeline
+            return await _run_market_strategy_pipeline()
+
         # ── Step 1: Slot guard ────────────────────────────────────────────────
         # Check if there is actually a free slot to fill.
         # next_available_slot() already checks occupied slots from the DB.
@@ -137,10 +158,19 @@ async def run_content_pipeline(run_now: bool = False) -> dict[str, Any]:
                           if selection.last_5_post_topics else ""
         trigger = selection.signal_card.get("trigger", selection.topic)
 
+        # Fetch recent angles for diversity tracking
+        used_angles: list[str] = []
+        try:
+            recent_angle_rows = queries.get_used_angles(n=6)
+            used_angles = [r["used_angle"] for r in recent_angle_rows if r.get("used_angle")]
+        except Exception:
+            pass
+
         post_text = await generate_post(
             topic=selection.topic,
             last_topics=last_topics_str,
             signal_card=trigger,
+            used_angles=used_angles,
         )
 
         # Strip markdown formatting that LinkedIn renders as literal characters
@@ -198,6 +228,16 @@ async def run_content_pipeline(run_now: bool = False) -> dict[str, Any]:
         result["post_id"] = post_id
         logger.info("Post saved to Supabase: %s", post_id)
 
+        # Save angle + topic slug for diversity tracking
+        try:
+            from services.content_generator import detect_angle
+            angle = detect_angle(post_text)
+            topic_slug = selection.topic.lower().strip()[:120]
+            queries.save_post_angle(post_id, angle, topic_slug)
+            logger.info("Saved angle='%s' slug='%s'", angle, topic_slug[:40])
+        except Exception as exc:
+            logger.warning("Failed to save post angle: %s", exc)
+
         # ── Step 7: Mark telegram input as used if P1 ─────────────────────────
         if selection.telegram_input_id:
             try:
@@ -205,22 +245,6 @@ async def run_content_pipeline(run_now: bool = False) -> dict[str, Any]:
                 logger.info("Marked telegram input %s as used", selection.telegram_input_id)
             except Exception as exc:
                 logger.warning("Failed to mark telegram input as used: %s", exc)
-
-        # ── Step 7b: Mark LinkedIn signal as used so it doesn't repeat ────────
-        # mark_signal_used was never called anywhere — this caused the same
-        # cached LinkedIn topic to be picked on every pipeline run within 24h.
-        try:
-            signal_topic = selection.signal_card.get("selected_topic", "")
-            if signal_topic:
-                # Find the signal record by topic string and mark it used
-                all_signals = queries.get_unused_signals(source="linkedin_trending", max_age_hours=24)
-                for sig in all_signals:
-                    if sig.get("topic", "").lower().strip() == signal_topic.lower().strip():
-                        queries.mark_signal_used(sig["id"], post_id)
-                        logger.info("Marked LinkedIn signal '%s' as used", signal_topic[:50])
-                        break
-        except Exception as exc:
-            logger.warning("Failed to mark LinkedIn signal as used: %s", exc)
 
         # ── Step 8: Telegram notification ─────────────────────────────────────
         await _send_draft_notification(
@@ -405,6 +429,104 @@ def _compute_viral_score(post_text: str) -> int:
 # ---------------------------------------------------------------------------
 # Sync wrapper for APScheduler
 # ---------------------------------------------------------------------------
+
+
+async def _run_market_strategy_pipeline() -> dict:
+    """
+    Thursday-specific pipeline: picks a Market Strategy story and generates
+    a post in the personal storytelling format with a trending hook.
+    """
+    result = {"success": False, "skipped": False, "post_id": None,
+              "topic": None, "error": None, "is_market_strategy": True}
+    try:
+        from db import queries
+        from services.content_generator import generate_market_strategy_post, detect_angle
+        from services.schedule_utils import next_available_slot
+
+        # Get unused strategy
+        strategy = queries.get_unused_market_strategy()
+        if not strategy:
+            logger.warning("[market_strategy] No strategies available — falling back to regular pipeline")
+            return await run_content_pipeline(run_now=True)
+
+        # Get used trending refs for deduplication
+        used_refs = queries.get_used_trending_refs(n=20)
+
+        # Generate post
+        post_text, trending_ref = await generate_market_strategy_post(
+            strategy=strategy,
+            used_trending_refs=used_refs,
+        )
+
+        # Clean up
+        import re as _re
+        post_text = post_text.replace("**", "").replace("__", "")
+        post_text = _re.sub(r"  +", " ", post_text).strip()
+
+        scheduled_time = next_available_slot()
+
+        # Build signal card
+        signal_card = {
+            "primary_signal": "market_strategy",
+            "selected_topic": strategy.get("title", ""),
+            "trigger": f"Thursday Market Strategy: {strategy.get('strategy_name', '')} — {strategy.get('company', '')}",
+            "niche_match": ["Market Strategy"],
+            "company": strategy.get("company", ""),
+            "strategy_name": strategy.get("strategy_name", ""),
+            "industry": strategy.get("industry", ""),
+        }
+
+        from services.content_pipeline import _compute_viral_score
+        viral_score = _compute_viral_score(post_text)
+
+        post_row = queries.create_post(
+            content=post_text,
+            scheduled_time=scheduled_time,
+            signal_card=signal_card,
+            viral_score=viral_score,
+            platform="linkedin",
+        )
+        post_id = post_row["id"]
+
+        # Save angle + topic slug
+        angle = detect_angle(post_text)
+        queries.save_post_angle(post_id, angle, strategy.get("title", "").lower()[:120])
+
+        # Mark strategy as used
+        queries.mark_market_strategy_used(strategy["id"], post_id)
+
+        # Save trending reference
+        if trending_ref:
+            queries.save_used_trending_ref(post_id, trending_ref)
+
+        # Notify via Telegram
+        from routers.telegram import send_telegram_message
+        from services.schedule_utils import human_readable_slot
+        readable = human_readable_slot(scheduled_time)
+
+        await send_telegram_message(
+            f"📊 <b>Thursday Market Strategy Draft</b>\n\n"
+            f"<b>Scheduled:</b> {readable}\n"
+            f"<b>Strategy:</b> {strategy.get('strategy_name')}\n"
+            f"<b>Company:</b> {strategy.get('company')}\n"
+            f"<b>Post ID:</b> <code>{post_id[:8]}</code>\n\n"
+            f"{post_text[:400]}...\n\n"
+            f"/approve — Approve\n"
+            f"/reject — Reject and get a different strategy\n"
+            f"/generate_image — Attach image"
+        )
+
+        result["success"] = True
+        result["post_id"] = post_id
+        result["topic"] = strategy.get("title")
+        logger.info("[market_strategy] Pipeline complete: post_id=%s", post_id)
+
+    except Exception as exc:
+        logger.error("[market_strategy] Pipeline failed: %s", exc, exc_info=True)
+        result["error"] = str(exc)
+
+    return result
+
 
 def run_content_pipeline_sync() -> dict[str, Any]:
     """Sync wrapper called by APScheduler as fallback."""
