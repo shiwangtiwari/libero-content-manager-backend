@@ -303,13 +303,16 @@ def upsert_post_metrics(post_id: str, metrics: dict) -> None:
 def set_pending_image_post(post_id: str) -> None:
     """
     Store which post is waiting for an image upload.
-    Persisted to Supabase so it survives Railway restarts.
+    Uses upsert so this works even if the user_profile row does not exist yet.
+    update() silently does nothing on a missing row — that was the bug causing
+    [ERROR] No post waiting for an image on every photo send.
     """
     db = get_supabase()
     try:
-        db.table("user_profile").update({
+        db.table("user_profile").upsert({
+            "id": "shiwang",
             "pending_image_post_id": post_id,
-        }).eq("id", "shiwang").execute()
+        }).execute()
     except Exception as e:
         import logging
         logging.getLogger(__name__).error("set_pending_image_post error: %s", e)
@@ -332,12 +335,13 @@ def get_pending_image_post() -> Optional[str]:
 
 
 def clear_pending_image_post() -> None:
-    """Clear the pending image post ID after the image has been attached."""
+    """Clear the pending image post ID after the image has been attached. Uses upsert."""
     db = get_supabase()
     try:
-        db.table("user_profile").update({
+        db.table("user_profile").upsert({
+            "id": "shiwang",
             "pending_image_post_id": None,
-        }).eq("id", "shiwang").execute()
+        }).execute()
     except Exception as e:
         import logging
         logging.getLogger(__name__).error("clear_pending_image_post error: %s", e)
