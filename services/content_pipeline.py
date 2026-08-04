@@ -78,9 +78,26 @@ async def run_content_pipeline() -> dict[str, Any]:
         viral_score = _compute_viral_score(post_text)
         logger.info("Viral score: %d/100", viral_score)
 
-        # Step 4: Compute next posting slot
+        # Step 4: Compute next posting slot + duplicate guard
+        # Check BEFORE generating if a draft already exists for the next slot.
+        # This prevents: Tue 6AM gen fires, finds Wed+Thu both occupied,
+        # skips to Tue next week instead of doing nothing.
         from services.schedule_utils import next_available_slot
-        scheduled_time = next_available_slot()
+        from db import queries as _q
+        upcoming_slot = next_available_slot()
+        existing = _q.get_posts_by_status(
+            ["draft", "approved", "scheduled", "pending_reschedule"]
+        )
+        occupied_slots = {p["scheduled_time"] for p in existing if p.get("scheduled_time")}
+        if upcoming_slot in occupied_slots:
+            logger.info(
+                "Duplicate guard: slot %s already has a post — skipping generation",
+                upcoming_slot,
+            )
+            result["success"] = True
+            result["topic"] = f"skipped — {upcoming_slot} already occupied"
+            return result
+        scheduled_time = upcoming_slot
         logger.info("Next posting slot: %s IST", scheduled_time)
 
         # Step 5: Save to Supabase
