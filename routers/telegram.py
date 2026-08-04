@@ -601,17 +601,29 @@ async def handle_photo_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
         status = post.get("status", "draft") if post else "draft"
         stored_ok = not public_url.startswith("telegram://")
 
+        if stored_ok:
+            img_line = (
+                f"URL        <a href=\"{public_url}\">Tap to verify image loads</a>"
+            )
+            confidence = "[CONFIRMED] Image will post to LinkedIn."
+        else:
+            img_line = f"URL        {public_url[:60]}"
+            confidence = "[WARN] Supabase upload failed. Post will go text-only unless you retry."
+
         await update.message.reply_text(
             f"<b>[IMAGE SAVED]</b>\n\n"
             f"<code>POST ID    {post_id[:8].upper()}\n"
             f"STATUS     {status.upper()}\n"
-            f"STORAGE    {'SUPABASE OK' if stored_ok else 'LOCAL REF (upload failed)'}</code>\n\n"
+            f"STORAGE    {'SUPABASE OK' if stored_ok else 'FAILED — telegram:// fallback'}</code>\n"
+            f"{img_line}\n\n"
+            f"{confidence}\n\n"
             + (
-                "Post is approved — goes live at scheduled time with this image."
+                "Goes live at scheduled time with this image."
                 if status == "approved" else
                 "Send /approve to confirm. Post will publish with this image."
             ),
             parse_mode="HTML",
+            disable_web_page_preview=True,
         )
 
     except Exception as e:
@@ -655,6 +667,58 @@ async def handle_run_now(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.message.reply_text(f"[ERROR] Pipeline trigger failed: {e}")
 
 
+# ── Command: /check_image ─────────────────────────────────────────────────────
+
+async def handle_check_image(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Check image status for all posts in queue.
+    Shows exactly what will happen at posting time:
+      CONFIRMED  → https:// URL, Supabase reachable → will post WITH image
+      NO IMAGE   → no image_url set → will post TEXT ONLY
+      BAD URL    → telegram:// fallback → will post TEXT ONLY
+    """
+    posts = queries.get_posts_by_status(["approved", "draft", "scheduled"])
+    if not posts:
+        await update.message.reply_text(
+            "<b>[IMAGE CHECK]</b>\n\n<code>No posts in queue.</code>",
+            parse_mode="HTML",
+        )
+        return
+
+    lines = ["<b>[IMAGE CHECK]</b>\n"]
+    for p in posts:
+        url = p.get("image_url") or ""
+        pid = p["id"][:8].upper()
+        slot = p.get("scheduled_time", "?")
+        hook = next((l.strip() for l in (p.get("content") or "").split("\n") if l.strip()), "")[:40]
+
+        if not url:
+            verdict = "NO IMAGE   — will post TEXT ONLY"
+            url_line = "Run /generate_image to attach one."
+        elif url.startswith("https://"):
+            verdict = "CONFIRMED  — will post WITH IMAGE"
+            url_line = f'<a href="{url}">Tap to verify image loads</a>'
+        elif url.startswith("telegram://"):
+            verdict = "BAD URL    — Supabase upload failed, TEXT ONLY"
+            url_line = "Run /generate_image again and resend the photo."
+        else:
+            verdict = f"UNKNOWN    — {url[:40]}"
+            url_line = "Run /generate_image to replace."
+
+        lines.append(
+            f"<code>{pid}  [{p['status'].upper()}]  {slot}\n"
+            f"{hook}...\n"
+            f"{verdict}</code>\n"
+            f"{url_line}"
+        )
+
+    await update.message.reply_text(
+        "\n\n".join(lines),
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+    )
+
+
 # ── Application factory ───────────────────────────────────────────────────────
 
 def build_telegram_app() -> Application:
@@ -668,6 +732,7 @@ def build_telegram_app() -> Application:
     app.add_handler(CommandHandler("queue", handle_queue))
     app.add_handler(CommandHandler("generate_image", handle_generate_image))
     app.add_handler(CommandHandler("run_now", handle_run_now))
+    app.add_handler(CommandHandler("check_image", handle_check_image))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo_input))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_mind_input))
     return app
