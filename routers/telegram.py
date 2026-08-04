@@ -634,17 +634,68 @@ async def handle_photo_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
 # ── Plain text handler — what's on my mind ────────────────────────────────────
 
 async def handle_mind_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Any non-command text is treated as a content signal (P1 priority)."""
+    """
+    Any non-command text handler.
+    First checks if it's a reply to /schedule_next (1 or 2).
+    Otherwise treats as a content signal (P1 priority).
+    Also checks if it introduces a genuinely new topic — if so, saves to
+    custom_topics table so it becomes part of the permanent pool.
+    """
     if str(update.effective_chat.id) != settings.TELEGRAM_CHAT_ID:
         return
     text = update.message.text.strip()
+
+    # Check if this is a reply to /schedule_next
+    chat_id = str(update.effective_chat.id)
+    if text in ("1", "2") and chat_id in _pending_schedule_next:
+        handled = await handle_schedule_next_choice(chat_id, text, update)
+        if handled:
+            return
+
     queries.create_telegram_input(message=text, source="telegram")
+
+    # Check if this introduces a new topic not already in the pool
+    new_topic_saved = False
+    try:
+        if len(text) >= 10 and not queries.topic_exists_in_pool(text):
+            # Detect category from the text
+            import re as _re
+            t = text.lower()
+            if _re.search(r"gta|game|gaming|playstation|xbox|steam", t):
+                cat = "Gaming"
+            elif _re.search(r"netflix|ott|bollywood|movie|series|show|web series", t):
+                cat = "Culture"
+            elif _re.search(r"ai|chatgpt|claude|llm|gemini|copilot|automation", t):
+                cat = "AI"
+            elif _re.search(r"build|automat|deploy|ship|launch|product", t):
+                cat = "Building"
+            elif _re.search(r"india|startup|saas|bengaluru|gurugram|delhi", t):
+                cat = "India Tech"
+            elif _re.search(r"dev.*pm|engineer.*pm|pm.*developer|transition|switch", t):
+                cat = "Developer-to-PM"
+            elif _re.search(r"product|pm|roadmap|priorit|sprint|okr|user research", t):
+                cat = "Product Management"
+            else:
+                cat = "Personal"
+            queries.create_custom_topic(topic=text[:200], category=cat)
+            new_topic_saved = True
+    except Exception as exc:
+        logger.warning("Custom topic detection failed (non-fatal): %s", exc)
+
+    extra = ""
+    if new_topic_saved:
+        extra = (
+            "\n\n<code>NEW TOPIC ADDED to pool permanently.</code>\n"
+            "Future posts can pick this up even without a Telegram input."
+        )
+
     await update.message.reply_text(
         f"<b>[SIGNAL SAVED]</b>\n\n"
         f"<code>PRIORITY   P1 (highest)\n"
         f"SOURCE     telegram\n"
         f"FIRES AT   next content generation</code>\n\n"
-        f"<i>\"{text[:100]}\"</i>",
+        f"<i>\"{text[:100]}\"</i>"
+        + extra,
         parse_mode="HTML",
     )
 
@@ -770,6 +821,203 @@ async def handle_post_now(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
 
 
+
+# ── Command: /schedule_next ───────────────────────────────────────────────────
+
+# State machine for /schedule_next — stored in memory (Railway restart clears it,
+# acceptable since this is a short interactive flow)
+_pending_schedule_next: dict[str, str] = {}  # {chat_id: post_id}
+
+
+async def handle_schedule_next(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Insert the most recent draft into the schedule and ask whether to:
+    1. Push to next posting day (shifting existing approved posts back)
+    2. Schedule to next open slot
+    
+    Usage: /schedule_next
+    Then reply with 1 or 2.
+    """
+    if str(update.effective_chat.id) != settings.TELEGRAM_CHAT_ID:
+        return
+
+    drafts = queries.get_posts_by_status(["draft", "pending_reschedule"])
+    if not drafts:
+        await update.message.reply_text(
+            "[ERROR] No draft posts found.\n\n"
+            "Run /run_now to generate a draft first."
+        )
+        return
+
+    post = drafts[0]
+    post_id = post["id"]
+    hook = next((l.strip() for l in (post.get("content") or "").split("\n") if l.strip()), "")[:55]
+
+    # Find next posting day slot and check if it's occupied
+    from services.post_manager import next_available_slot, POSTING_SLOTS
+    from datetime import datetime, timedelta
+    import pytz as _pytz
+    _IST = _pytz.timezone("Asia/Kolkata")
+    now = datetime.now(_IST)
+
+    # Find the chronologically next posting slot (occupied or not)
+    next_slots = []
+    for delta in range(8):
+        candidate_date = (now + timedelta(days=delta)).date()
+        weekday = candidate_date.weekday()
+        for wd, hour, minute in POSTING_SLOTS:
+            if weekday == wd:
+                from datetime import datetime as _dt
+                slot_dt = _IST.localize(_dt(
+                    candidate_date.year, candidate_date.month,
+                    candidate_date.day, hour, minute
+                ))
+                if slot_dt > now:
+                    next_slots.append(slot_dt.strftime("%Y-%m-%d %H:%M"))
+
+    next_slots = sorted(set(next_slots))[:3]
+
+    # Check which slots are occupied
+    queued = queries.get_posts_by_status(["approved", "scheduled", "pending_reschedule"])
+    occupied = {p["scheduled_time"]: p for p in queued if p.get("scheduled_time")}
+
+    next_day_slot = next_slots[0] if next_slots else None
+    open_slot = next_available_slot()
+
+    next_day_occupied = next_day_slot and next_day_slot in occupied
+    next_day_post = occupied.get(next_day_slot, {})
+    next_day_hook = ""
+    if next_day_post:
+        next_day_hook = next((
+            l.strip() for l in (next_day_post.get("content") or "").split("\n") if l.strip()
+        ), "")[:40]
+
+    # Save pending state
+    _pending_schedule_next[settings.TELEGRAM_CHAT_ID] = post_id
+
+    if next_day_occupied:
+        option1_text = (
+            f"<b>1</b> — Post on <b>{next_day_slot}</b> (next posting day)\n"
+            f"   Pushes current post (<i>{next_day_hook}...</i>) to the slot after"
+        )
+    else:
+        option1_text = f"<b>1</b> — Post on <b>{next_day_slot}</b> (next posting day, slot is open)"
+
+    option2_text = f"<b>2</b> — Schedule for next open slot: <b>{open_slot}</b>"
+
+    await update.message.reply_text(
+        f"<b>[SCHEDULE]</b>\n\n"
+        f"<code>DRAFT      {post_id[:8].upper()}\n"
+        f"HOOK       {hook}...</code>\n\n"
+        f"Where should this post go?\n\n"
+        f"{option1_text}\n\n"
+        f"{option2_text}\n\n"
+        f"Reply with <b>1</b> or <b>2</b>.",
+        parse_mode="HTML",
+    )
+
+
+async def handle_schedule_next_choice(chat_id: str, choice: str, update: Update) -> bool:
+    """
+    Handle the 1/2 reply after /schedule_next.
+    Returns True if handled, False if not a schedule_next reply.
+    """
+    post_id = _pending_schedule_next.get(chat_id)
+    if not post_id:
+        return False
+    if choice not in ("1", "2"):
+        return False
+
+    del _pending_schedule_next[chat_id]
+
+    from services.post_manager import next_available_slot, POSTING_SLOTS
+    from datetime import datetime, timedelta
+    import pytz as _pytz
+    _IST = _pytz.timezone("Asia/Kolkata")
+    now = datetime.now(_IST)
+
+    if choice == "2":
+        # Simple: assign to next open slot
+        slot = next_available_slot()
+        queries.update_post_status(post_id, "approved", {"scheduled_time": slot})
+        await update.message.reply_text(
+            f"<b>[SCHEDULED]</b>\n\n"
+            f"<code>SLOT   {slot} IST\n"
+            f"ID     {post_id[:8].upper()}</code>\n\n"
+            f"Post will go live at the scheduled time.",
+            parse_mode="HTML",
+        )
+        return True
+
+    # Choice 1: push to next posting day, shift existing posts back
+    # Find next posting day slot
+    next_slots = []
+    for delta in range(8):
+        candidate_date = (now + timedelta(days=delta)).date()
+        weekday = candidate_date.weekday()
+        for wd, hour, minute in POSTING_SLOTS:
+            if weekday == wd:
+                from datetime import datetime as _dt
+                slot_dt = _IST.localize(_dt(
+                    candidate_date.year, candidate_date.month,
+                    candidate_date.day, hour, minute
+                ))
+                if slot_dt > now:
+                    next_slots.append((slot_dt, slot_dt.strftime("%Y-%m-%d %H:%M")))
+
+    if not next_slots:
+        await update.message.reply_text("[ERROR] Could not find next posting slot.")
+        return True
+
+    next_slots.sort(key=lambda x: x[0])
+    target_slot_str = next_slots[0][1]
+
+    # Get all approved posts sorted by slot
+    queued = queries.get_posts_by_status(["approved", "scheduled"])
+    queued_sorted = sorted(
+        [p for p in queued if p.get("scheduled_time") and p["id"] != post_id],
+        key=lambda p: p["scheduled_time"]
+    )
+
+    # Build the full ordered slot list
+    all_slot_strs = sorted(set([s for _, s in next_slots[:6]]))
+
+    # Shift occupied posts: each gets bumped to the next slot in sequence
+    occupied_at_target = [p for p in queued_sorted if p["scheduled_time"] == target_slot_str]
+    if occupied_at_target:
+        # Shift chain: find all posts in sequence and push each one forward
+        bumped = []
+        for i, p in enumerate(queued_sorted):
+            if i < len(all_slot_strs) - 1:
+                next_slot = all_slot_strs[i + 1]
+            else:
+                # Find next available after all known slots
+                last_slot_dt = next_slots[min(i, len(next_slots)-1)][0]
+                # Find the slot after this one
+                extra_slot = next_available_slot(after=last_slot_dt)
+                next_slot = extra_slot
+            queries.update_post_status(p["id"], p["status"], {"scheduled_time": next_slot})
+            bumped.append(f"{p['id'][:8]} → {next_slot}")
+
+        bump_summary = "\n".join(f"  {b}" for b in bumped[:3])
+        shifted_msg = f"\n\n<code>Shifted posts:\n{bump_summary}</code>"
+    else:
+        shifted_msg = ""
+
+    # Assign the new post to the target slot
+    queries.update_post_status(post_id, "approved", {"scheduled_time": target_slot_str})
+
+    await update.message.reply_text(
+        f"<b>[SCHEDULED]</b>\n\n"
+        f"<code>SLOT   {target_slot_str} IST\n"
+        f"ID     {post_id[:8].upper()}</code>\n\n"
+        f"Post inserted at next posting day."
+        + shifted_msg,
+        parse_mode="HTML",
+    )
+    return True
+
+
 # ── Command: /check_image ─────────────────────────────────────────────────────
 
 async def handle_check_image(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -822,6 +1070,171 @@ async def handle_check_image(update: Update, context: ContextTypes.DEFAULT_TYPE)
     )
 
 
+
+# ── Command: /health_check ────────────────────────────────────────────────────
+
+async def handle_health_check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Full end-to-end pipeline health check.
+    Tests: Anthropic API, Supabase, LinkedIn token, Storage upload,
+    post generation, image prompt. Ends with a real LinkedIn post
+    (labelled as health check test) — you delete it after confirming.
+
+    This is a long-running command (~2-3 minutes). The bot sends
+    progress updates as each step completes.
+    """
+    if str(update.effective_chat.id) != settings.TELEGRAM_CHAT_ID:
+        return
+
+    await update.message.reply_text(
+        "<b>[HEALTH CHECK]</b> Starting full pipeline test...\n\n"
+        "<code>This will take 2-3 minutes.\n"
+        "A test post will be published to LinkedIn.\n"
+        "Delete it after confirming.</code>",
+        parse_mode="HTML",
+    )
+
+    results: list[tuple[str, bool, str]] = []  # (label, passed, detail)
+
+    async def step(label: str, passed: bool, detail: str = ""):
+        results.append((label, passed, detail))
+        icon = "✅" if passed else "❌"
+        await update.message.reply_text(
+            f"{icon} <b>{label}</b>" + (f"\n<code>{detail[:200]}</code>" if detail else ""),
+            parse_mode="HTML",
+        )
+
+    # Step 1: Anthropic API
+    try:
+        import os, httpx as _httpx
+        api_key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+        async with _httpx.AsyncClient(timeout=15) as client:
+            resp = await client.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={"x-api-key": api_key, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+                json={"model": "claude-sonnet-4-5", "max_tokens": 10,
+                      "messages": [{"role": "user", "content": "Reply: OK"}]},
+            )
+        ok = resp.status_code == 200
+        await step("Anthropic API", ok, "claude-sonnet-4-5 reachable" if ok else f"HTTP {resp.status_code}")
+    except Exception as e:
+        await step("Anthropic API", False, str(e)[:100])
+
+    # Step 2: Supabase
+    try:
+        posts = queries.get_posts_by_status("posted")
+        await step("Supabase DB", True, f"{len(posts)} posted posts readable")
+    except Exception as e:
+        await step("Supabase DB", False, str(e)[:100])
+
+    # Step 3: LinkedIn token
+    try:
+        from services.health_monitor import run_session_health_check
+        health = await run_session_health_check()
+        ok = health.get("healthy", False)
+        await step("LinkedIn Token", ok, "Token valid" if ok else str(health.get("issues", []))[:100])
+    except Exception as e:
+        await step("LinkedIn Token", False, str(e)[:100])
+
+    # Step 4: Supabase Storage
+    try:
+        import httpx as _httpx, time as _time
+        from config import settings as _s
+        test_bytes = b"\x89PNG\r\n\x1a\n" + b"\x00" * 100  # minimal fake PNG
+        storage_path = f"health_check/test_{int(_time.time())}.png"
+        upload_url = f"{_s.SUPABASE_URL}/storage/v1/object/post-images/{storage_path}"
+        async with _httpx.AsyncClient(timeout=15) as client:
+            up = await client.post(
+                upload_url, content=test_bytes,
+                headers={"Authorization": f"Bearer {_s.SUPABASE_SERVICE_KEY}",
+                         "Content-Type": "image/png", "x-upsert": "true"},
+            )
+        ok = up.status_code in (200, 201)
+        if ok:
+            # Clean up
+            async with _httpx.AsyncClient(timeout=10) as client:
+                await client.delete(
+                    f"{_s.SUPABASE_URL}/storage/v1/object/post-images/{storage_path}",
+                    headers={"Authorization": f"Bearer {_s.SUPABASE_SERVICE_KEY}"},
+                )
+        await step("Supabase Storage", ok, "Upload + delete OK" if ok else f"HTTP {up.status_code}")
+    except Exception as e:
+        await step("Supabase Storage", False, str(e)[:100])
+
+    # Step 5: Post generation
+    test_post_text = ""
+    try:
+        from services.content_generator import generate_post
+        test_post_text = await generate_post(
+            topic="[LIBERO HEALTH CHECK] This is an automated test post — please ignore or delete",
+            last_topics="",
+            signal_card="Health check test — generate a very short 3-sentence post",
+        )
+        ok = len(test_post_text) > 20
+        await step("Post Generation", ok, f"{len(test_post_text)} chars generated")
+    except Exception as e:
+        await step("Post Generation", False, str(e)[:100])
+        test_post_text = "[LIBERO HEALTH CHECK] Automated test post. Please delete this."
+
+    # Step 6: Image prompt generation
+    try:
+        from routers.telegram import _build_image_prompt
+        prompt = _build_image_prompt({
+            "content": test_post_text,
+            "signal_card": {"selected_topic": "Health check test"},
+        })
+        ok = len(prompt) > 50
+        await step("Image Prompt", ok, f"{len(prompt)} char prompt generated")
+        await update.message.reply_text(
+            f"<b>IMAGE PROMPT FOR TEST:</b>\n\n<code>{prompt[:400]}</code>\n\n"
+            f"Generate an image from this prompt and send it here as a photo.\n"
+            f"Then I will post to LinkedIn with it.",
+            parse_mode="HTML",
+        )
+    except Exception as e:
+        await step("Image Prompt", False, str(e)[:100])
+
+    # Save health check draft to Supabase so photo handler can attach image
+    try:
+        from services.schedule_utils import next_available_slot
+        hc_slot = next_available_slot()
+        hc_post = queries.create_post(
+            content=test_post_text,
+            scheduled_time=hc_slot,
+            signal_card={"selected_topic": "Health check test", "trigger": "LIBERO HEALTH CHECK"},
+            viral_score=0,
+            platform="linkedin",
+        )
+        hc_id = hc_post["id"]
+        queries.set_pending_image_post(hc_id)
+        await update.message.reply_text(
+            f"<b>[HEALTH CHECK DRAFT SAVED]</b>\n\n"
+            f"<code>POST ID  {hc_id[:8].upper()}</code>\n\n"
+            f"1. Generate image from prompt above\n"
+            f"2. Send it here as a photo\n"
+            f"3. Bot will post to LinkedIn with image\n"
+            f"4. Check LinkedIn and delete the test post\n\n"
+            f"Or send /post_now {hc_id[:8]} to post text-only now.",
+            parse_mode="HTML",
+        )
+    except Exception as e:
+        await update.message.reply_text(f"[ERROR] Could not save health check draft: {e}")
+
+    # Summary
+    passed = sum(1 for _, ok, _ in results if ok)
+    total = len(results)
+    all_ok = passed == total
+    summary_icon = "✅" if all_ok else "⚠️"
+    await update.message.reply_text(
+        f"{summary_icon} <b>Health check: {passed}/{total} passed</b>\n\n"
+        + ("\n".join(
+            f"{'✅' if ok else '❌'} {label}"
+            for label, ok, _ in results
+        )),
+        parse_mode="HTML",
+    )
+
+
 # ── Application factory ───────────────────────────────────────────────────────
 
 def build_telegram_app() -> Application:
@@ -836,6 +1249,8 @@ def build_telegram_app() -> Application:
     app.add_handler(CommandHandler("generate_image", handle_generate_image))
     app.add_handler(CommandHandler("run_now", handle_run_now))
     app.add_handler(CommandHandler("post_now", handle_post_now))
+    app.add_handler(CommandHandler("schedule_next", handle_schedule_next))
+    app.add_handler(CommandHandler("health_check", handle_health_check))
     app.add_handler(CommandHandler("check_image", handle_check_image))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo_input))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_mind_input))
