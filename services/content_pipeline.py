@@ -2,15 +2,26 @@
 services/content_pipeline.py — Full autonomous content generation pipeline.
 
 Called by APScheduler on Mon/Tue/Wed at 6:00 AM IST.
+Also called manually via /run_now Telegram command or POST /run_now endpoint.
 
 Pipeline steps:
-  1. Collect signals         → signal_collector.collect_all_signals()
-  2. Select topic            → content_brain.select_topic()
-  3. Generate post           → content_generator.generate_post(topic, last_topics, signal_card)
-  4. Compute next slot       → schedule_utils.next_available_slot()
-  5. Save to Supabase        → queries.create_post()
-  6. Mark telegram input used → queries.mark_telegram_input_used() [if P1]
-  7. Telegram notification   → routers.telegram.send_telegram_message()
+  1. Slot guard             → skip if ALL three weekly slots already have a post
+  2. Collect signals        → signal_collector.collect_all_signals()
+  3. Select topic           → content_brain.select_topic()
+  4. Generate post          → content_generator.generate_post(topic, last_topics, signal_card)
+  5. Compute next slot      → schedule_utils.next_available_slot()
+  6. Save to Supabase       → queries.create_post()
+  7. Mark telegram input    → queries.mark_telegram_input_used() [if P1]
+  8. Telegram notification  → routers.telegram.send_telegram_message()
+
+Fix (2026-08-04):
+  - Slot guard added at step 1: if next_available_slot() finds no empty slot
+    (i.e. all Tue/Wed/Thu this week already have a draft/approved/scheduled post),
+    the pipeline returns {"success": True, "skipped": True} immediately.
+    This prevents duplicate posts when Shiwang manually generates all three posts
+    on Monday. The Mon/Tue/Wed 6AM scheduler jobs will all skip gracefully.
+  - When /run_now is triggered manually, the guard is bypassed intentionally
+    (run_now=True flag) so Shiwang can still force-generate if needed.
 
 All DB calls use YOUR exact queries.py function signatures.
 generate_post signature matches YOUR services/content_generator.py exactly.
@@ -25,19 +36,86 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 
-async def run_content_pipeline() -> dict[str, Any]:
+async def run_content_pipeline(run_now: bool = False) -> dict[str, Any]:
     """
     Execute the full content generation pipeline.
-    Returns: {"success": bool, "post_id": str|None, "topic": str|None, "error": str|None}
+
+    Args:
+        run_now: If True, bypass the slot guard (manual /run_now trigger).
+
+    Returns:
+        {
+          "success": bool,
+          "skipped": bool,   # True if slot guard fired
+          "post_id": str|None,
+          "topic": str|None,
+          "error": str|None
+        }
     """
     result: dict[str, Any] = {
-        "success": False, "post_id": None, "topic": None, "error": None
+        "success": False, "skipped": False,
+        "post_id": None, "topic": None, "error": None
     }
 
     try:
-        logger.info("=== Content pipeline starting ===")
+        logger.info("=== Content pipeline starting (run_now=%s) ===", run_now)
 
-        # Step 1: Collect signals
+        # ── Step 1: Slot guard ────────────────────────────────────────────────
+        # Check if there is actually a free slot to fill.
+        # next_available_slot() already checks occupied slots from the DB.
+        # But we need to confirm the slot it returns isn't already beyond this
+        # week — if it had to go 2+ weeks out, all this week's slots are full.
+        #
+        # Only enforce when run_now=False (scheduled auto-generation).
+        # Manual /run_now always proceeds regardless.
+        if not run_now:
+            from services.schedule_utils import next_available_slot, ist_now
+            from db import queries as _q
+
+            # How many of the three weekly slots already have a post?
+            queued = _q.get_posts_by_status(
+                ["draft", "approved", "scheduled", "pending_reschedule"]
+            )
+            queued_slots = {p["scheduled_time"] for p in queued if p.get("scheduled_time")}
+
+            # Compute all three posting slots for the next 7 days
+            import datetime as _dt
+            import pytz as _pytz
+            _IST = _pytz.timezone("Asia/Kolkata")
+            now = ist_now()
+            _WEEKLY_SLOTS = [(1, 8, 30), (2, 12, 0), (3, 9, 0)]
+            upcoming_slots: list[str] = []
+            for delta in range(8):
+                candidate_date = (now + _dt.timedelta(days=delta)).date()
+                weekday = candidate_date.weekday()
+                for wd, hour, minute in _WEEKLY_SLOTS:
+                    if weekday == wd:
+                        slot_dt = _IST.localize(_dt.datetime(
+                            candidate_date.year, candidate_date.month,
+                            candidate_date.day, hour, minute
+                        ))
+                        if slot_dt > now:
+                            slot_str = slot_dt.strftime("%Y-%m-%d %H:%M")
+                            upcoming_slots.append(slot_str)
+
+            # If every upcoming slot in the next 7 days already has a post → skip
+            open_slots = [s for s in upcoming_slots if s not in queued_slots]
+            if not open_slots:
+                logger.info(
+                    "[pipeline] Slot guard fired — all %d upcoming slots occupied (%s). Skipping.",
+                    len(upcoming_slots), queued_slots,
+                )
+                result["success"] = True
+                result["skipped"] = True
+                result["error"] = f"All slots occupied: {sorted(queued_slots)}"
+                return result
+
+            logger.info(
+                "[pipeline] Slot guard passed — %d open slot(s) available: %s",
+                len(open_slots), open_slots,
+            )
+
+        # ── Step 2: Collect signals ───────────────────────────────────────────
         from services.signal_collector import collect_all_signals
         bundle = await collect_all_signals()
         logger.info(
@@ -47,14 +125,13 @@ async def run_content_pipeline() -> dict[str, Any]:
             len(bundle.covered_topics),
         )
 
-        # Step 2: Select topic
+        # ── Step 3: Select topic ──────────────────────────────────────────────
         from services.content_brain import select_topic
         selection = select_topic(bundle)
         result["topic"] = selection.topic
         logger.info("Topic selected [%s]: '%s'", selection.priority, selection.topic)
 
-        # Step 3: Generate post via Anthropic API
-        # Matches YOUR content_generator.generate_post(topic, last_topics, signal_card) signature
+        # ── Step 4: Generate post via Anthropic API ───────────────────────────
         from services.content_generator import generate_post
         last_topics_str = "\n".join(f"- {t}" for t in selection.last_5_post_topics) \
                           if selection.last_5_post_topics else ""
@@ -69,7 +146,6 @@ async def run_content_pipeline() -> dict[str, Any]:
         # Strip markdown formatting that LinkedIn renders as literal characters
         import re as _re
         post_text = post_text.replace("**", "").replace("__", "")
-        # Clean up any double spaces left behind
         post_text = _re.sub(r"  +", " ", post_text).strip()
 
         logger.info("Post generated: %d chars", len(post_text))
@@ -97,7 +173,6 @@ async def run_content_pipeline() -> dict[str, Any]:
             post_text_v2 = _re2.sub(r"  +", " ", post_text_v2).strip()
             viral_score_v2 = _compute_viral_score(post_text_v2)
             logger.info("Viral score v2: %d/100", viral_score_v2)
-            # Use whichever version scored higher
             if viral_score_v2 > viral_score:
                 post_text = post_text_v2
                 viral_score = viral_score_v2
@@ -105,13 +180,12 @@ async def run_content_pipeline() -> dict[str, Any]:
             else:
                 logger.info("Keeping v1 post (v2 didn't improve)")
 
-        # Step 4: Compute next posting slot
+        # ── Step 5: Compute next posting slot ─────────────────────────────────
         from services.schedule_utils import next_available_slot
         scheduled_time = next_available_slot()
         logger.info("Next posting slot: %s IST", scheduled_time)
 
-        # Step 5: Save to Supabase
-        # Uses YOUR queries.create_post(content, scheduled_time, signal_card, viral_score, platform)
+        # ── Step 6: Save to Supabase ──────────────────────────────────────────
         from db import queries
         post_row = queries.create_post(
             content=post_text,
@@ -124,7 +198,7 @@ async def run_content_pipeline() -> dict[str, Any]:
         result["post_id"] = post_id
         logger.info("Post saved to Supabase: %s", post_id)
 
-        # Step 6: Mark telegram input as used if P1
+        # ── Step 7: Mark telegram input as used if P1 ─────────────────────────
         if selection.telegram_input_id:
             try:
                 queries.mark_telegram_input_used(selection.telegram_input_id, post_id)
@@ -132,7 +206,7 @@ async def run_content_pipeline() -> dict[str, Any]:
             except Exception as exc:
                 logger.warning("Failed to mark telegram input as used: %s", exc)
 
-        # Step 7: Telegram notification with draft + signal card
+        # ── Step 8: Telegram notification ─────────────────────────────────────
         await _send_draft_notification(
             post_id=post_id,
             post_text=post_text,
@@ -194,7 +268,6 @@ async def _send_draft_notification(
     trending = signal_card.get("trending_topics", [])
     niche = signal_card.get("niche_match", [])
 
-    # Build signal card section
     sc_lines = [f"<b>Signal:</b> {priority_label}"]
     if trigger:
         sc_lines.append(f"<b>Trigger:</b> {trigger[:120]}")
@@ -253,20 +326,18 @@ def _compute_viral_score(post_text: str) -> int:
     cta_line = content_lines[-1] if content_lines else ""
 
     # 1. Hook strength (0-20)
-    # Short, specific, surprising, or asks a question
     if first_line.endswith("?"):
         score += 18
     elif re.search(r"\d+", first_line):
-        score += 16   # has a number in hook
+        score += 16
     elif re.search(r"^(nobody|most|stop|why|the truth|unpopular|here|what)", first_line, re.I):
-        score += 15   # strong opening word
+        score += 15
     elif len(first_line) < 80:
         score += 11
     else:
         score += 5
 
     # 2. Personal voice (0-20)
-    # "I" statements with specific details are the highest trust signal
     personal = len(re.findall(r"\b(I |I'|my |me |I was|I learned|I built|I spent|I killed|I made)\b",
                               post_text, re.I))
     specific_time = bool(re.search(
@@ -287,7 +358,6 @@ def _compute_viral_score(post_text: str) -> int:
 
     # 4. Engagement CTA (0-20)
     if cta_line.endswith("?"):
-        # Real question vs generic "Thoughts?"
         if re.search(r"\b(what|how|when|which|have you|do you|what would|tell me)\b", cta_line, re.I):
             score += 20
         else:
@@ -299,17 +369,14 @@ def _compute_viral_score(post_text: str) -> int:
 
     # 5. Content quality signals (0-20)
     word_count = len(post_text.split())
-    # LinkedIn sweet spot: 150-250 words
     if 150 <= word_count <= 250:
         score += 8
     elif 100 <= word_count < 150 or 250 < word_count <= 300:
         score += 5
     else:
         score += 2
-    # Paragraph breaks (white space = readable)
     para_breaks = post_text.count("\n\n")
     score += min(7, para_breaks * 2)
-    # Hashtags present (max 3)
     hashtags = len(re.findall(r"#\w+", post_text))
     if 1 <= hashtags <= 3:
         score += 5
@@ -324,9 +391,5 @@ def _compute_viral_score(post_text: str) -> int:
 # ---------------------------------------------------------------------------
 
 def run_content_pipeline_sync() -> dict[str, Any]:
-    """
-    Sync wrapper called by APScheduler (which uses AsyncIOScheduler in your scheduler.py).
-    Since your scheduler is AsyncIOScheduler, it can call the async function directly.
-    This sync wrapper is provided as a fallback.
-    """
+    """Sync wrapper called by APScheduler as fallback."""
     return asyncio.run(run_content_pipeline())
