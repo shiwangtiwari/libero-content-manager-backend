@@ -667,6 +667,109 @@ async def handle_run_now(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.message.reply_text(f"[ERROR] Pipeline trigger failed: {e}")
 
 
+
+# ── Command: /post_now ───────────────────────────────────────────────────────
+
+async def handle_post_now(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Force-post an approved post to LinkedIn immediately — bypasses the scheduler.
+    Used for test runs and emergency posting outside the Tue/Wed/Thu slots.
+
+    Usage:
+      /post_now              → posts the most recent approved post
+      /post_now <id_or_num>  → posts a specific post by queue number or short ID
+
+    The post must be in 'approved' status. Draft posts need /approve first.
+    Uses the same claim → post → confirm flow as the scheduler so the duplicate
+    guard still applies — no risk of double-posting.
+    """
+    if str(update.effective_chat.id) != settings.TELEGRAM_CHAT_ID:
+        return
+
+    # Resolve which post to post
+    approved = queries.get_posts_by_status("approved")
+    if not approved:
+        await update.message.reply_text(
+            "[ERROR] No approved posts found.\n\n"
+            "Approve a draft first with /approve, then run /post_now."
+        )
+        return
+
+    if context.args:
+        post_id, err = _resolve_post_id(context.args[0], _QUEUE_STATUSES)
+        if err:
+            await update.message.reply_text(f"[ERROR] {err}")
+            return
+        post = queries.get_post_by_id(post_id)
+        if not post or post["status"] != "approved":
+            await update.message.reply_text(
+                f"[ERROR] Post {context.args[0]} is not approved "
+                f"(status: {post['status'] if post else 'not found'}).\n"
+                f"Run /approve first."
+            )
+            return
+    else:
+        post = approved[0]
+        post_id = post["id"]
+
+    # Image pre-flight — warn but don't block
+    image_url = post.get("image_url") or ""
+    if not image_url:
+        img_warn = "[NO IMAGE] Post will go live as TEXT ONLY.\n"
+    elif image_url.startswith("https://"):
+        img_warn = "[IMAGE OK] Will post with image.\n"
+    else:
+        img_warn = "[BAD IMAGE URL] Supabase upload previously failed — TEXT ONLY.\n"
+
+    hook = next((l.strip() for l in (post.get("content") or "").split("\n") if l.strip()), "")[:60]
+
+    await update.message.reply_text(
+        f"<b>[POST NOW]</b>\n\n"
+        f"<code>POST ID    {post_id[:8].upper()}\n"
+        f"SLOT       {post.get('scheduled_time', 'immediate')}\n"
+        f"HOOK       {hook}...</code>\n\n"
+        f"{img_warn}\n"
+        f"Posting to LinkedIn now...",
+        parse_mode="HTML",
+    )
+
+    # Claim the post atomically (duplicate guard)
+    claimed = queries.claim_post_for_posting(post_id)
+    if not claimed:
+        await update.message.reply_text(
+            "[ERROR] Could not claim post — it may have already been posted "
+            "or claimed by the scheduler. Check /queue."
+        )
+        return
+
+    try:
+        from services.linkedin_poster import post_to_linkedin
+        result = await post_to_linkedin(post_id)
+
+        post_url = f"https://www.linkedin.com/feed/update/{result['linkedin_post_id']}"
+        posted_with_image = result.get("posted_with_image", False)
+        img_result = "WITH IMAGE" if posted_with_image else "TEXT ONLY"
+
+        await update.message.reply_text(
+            f"<b>[POSTED]</b>\n\n"
+            f"<code>POST ID    {post_id[:8].upper()}\n"
+            f"IMAGE      {img_result}\n"
+            f"LI ID      {result['linkedin_post_id'][:30]}</code>\n\n"
+            f"View: {post_url}",
+            parse_mode="HTML",
+        )
+
+    except Exception as e:
+        # Revert so post can be retried
+        queries.revert_post_to_approved(post_id)
+        await update.message.reply_text(
+            f"<b>[POST FAILED]</b>\n\n"
+            f"<code>ERROR  {str(e)[:200]}</code>\n\n"
+            f"Post reverted to APPROVED. Fix the issue and try /post_now again.",
+            parse_mode="HTML",
+        )
+
+
 # ── Command: /check_image ─────────────────────────────────────────────────────
 
 async def handle_check_image(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -732,6 +835,7 @@ def build_telegram_app() -> Application:
     app.add_handler(CommandHandler("queue", handle_queue))
     app.add_handler(CommandHandler("generate_image", handle_generate_image))
     app.add_handler(CommandHandler("run_now", handle_run_now))
+    app.add_handler(CommandHandler("post_now", handle_post_now))
     app.add_handler(CommandHandler("check_image", handle_check_image))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo_input))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_mind_input))
