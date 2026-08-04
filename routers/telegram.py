@@ -209,12 +209,13 @@ async def handle_approve(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.message.reply_text(f"[ERROR] {result['error']}")
         return
 
-    post = result["post"]
+    # approve_post returns {"ok": True, "scheduled_time": "..."} — no "post" key
+    scheduled_time = result.get("scheduled_time", "TBD")
     await update.message.reply_text(
         f"<b>[CONFIRMED]</b>\n\n"
         f"<code>STATUS     APPROVED\n"
-        f"SLOT       {post.get('scheduled_time', 'TBD')} IST\n"
-        f"ID         {post['id'][:8].upper()}</code>\n\n"
+        f"SLOT       {scheduled_time} IST\n"
+        f"ID         {post_id[:8].upper()}</code>\n\n"
         f"Post will go live at the scheduled time.",
         parse_mode="HTML",
     )
