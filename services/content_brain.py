@@ -228,6 +228,26 @@ def _human_time(iso_str: str) -> str:
         return iso_str
 
 
+def _topic_already_queued(topic: str, bundle: SignalBundle) -> bool:
+    """
+    Returns True if this exact topic (or a very close variant) is already
+    in the queue as a draft/approved post. Prevents the same signal being
+    picked on every pipeline run when mark_signal_used() wasn't called,
+    and catches cases where category detection misses the duplicate
+    (e.g. GTA6 categorised as General so category block doesn't fire).
+    """
+    topic_lower = topic.lower().strip()[:80]
+    for queued_str in bundle.queued_topic_set:
+        # Exact match or one contains the other (handles trigger vs topic variants)
+        if topic_lower == queued_str:
+            return True
+        if len(topic_lower) > 15 and topic_lower in queued_str:
+            return True
+        if len(queued_str) > 15 and queued_str in topic_lower:
+            return True
+    return False
+
+
 def _category_is_blocked(category: str, bundle: SignalBundle) -> tuple[bool, str]:
     """
     Check whether a category should be avoided.
@@ -303,8 +323,10 @@ def select_topic(bundle: SignalBundle) -> TopicSelection:
 
     # --- P2/P3: LinkedIn trending ---
 
-    # Pass 1: gap fill + fully unblocked (not hard, not soft)
+    # Pass 1: gap fill + fully unblocked (not hard, not soft) + not already queued
     for lt in niche_topics:
+        if _topic_already_queued(lt.topic, bundle):
+            continue
         if not _topic_is_covered(lt.topic, bundle.covered_keyword_set):
             topic_categories = _detect_niche_matches(lt.topic)
             primary_cat = topic_categories[0] if topic_categories else ""
@@ -327,8 +349,10 @@ def select_topic(bundle: SignalBundle) -> TopicSelection:
                     telegram_input_id=None, last_5_post_topics=last5,
                 )
 
-    # Pass 2: gap fill, soft block tolerated (but NOT hard block)
+    # Pass 2: gap fill, soft block tolerated (but NOT hard block) + not already queued
     for lt in niche_topics:
+        if _topic_already_queued(lt.topic, bundle):
+            continue
         if not _topic_is_covered(lt.topic, bundle.covered_keyword_set):
             topic_categories = _detect_niche_matches(lt.topic)
             primary_cat = topic_categories[0] if topic_categories else ""
@@ -351,8 +375,10 @@ def select_topic(bundle: SignalBundle) -> TopicSelection:
                     telegram_input_id=None, last_5_post_topics=last5,
                 )
 
-    # Pass 3: any niche topic, not hard blocked
+    # Pass 3: any niche topic, not hard blocked, not already queued
     for lt in niche_topics:
+        if _topic_already_queued(lt.topic, bundle):
+            continue
         topic_categories = _detect_niche_matches(lt.topic)
         primary_cat = topic_categories[0] if topic_categories else ""
         hard_blocked = primary_cat in bundle.queued_category_set
