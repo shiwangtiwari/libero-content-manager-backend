@@ -206,6 +206,22 @@ async def run_content_pipeline(run_now: bool = False) -> dict[str, Any]:
             except Exception as exc:
                 logger.warning("Failed to mark telegram input as used: %s", exc)
 
+        # ── Step 7b: Mark LinkedIn signal as used so it doesn't repeat ────────
+        # mark_signal_used was never called anywhere — this caused the same
+        # cached LinkedIn topic to be picked on every pipeline run within 24h.
+        try:
+            signal_topic = selection.signal_card.get("selected_topic", "")
+            if signal_topic:
+                # Find the signal record by topic string and mark it used
+                all_signals = queries.get_unused_signals(source="linkedin_trending", max_age_hours=24)
+                for sig in all_signals:
+                    if sig.get("topic", "").lower().strip() == signal_topic.lower().strip():
+                        queries.mark_signal_used(sig["id"], post_id)
+                        logger.info("Marked LinkedIn signal '%s' as used", signal_topic[:50])
+                        break
+        except Exception as exc:
+            logger.warning("Failed to mark LinkedIn signal as used: %s", exc)
+
         # ── Step 8: Telegram notification ─────────────────────────────────────
         await _send_draft_notification(
             post_id=post_id,
