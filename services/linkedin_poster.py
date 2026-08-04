@@ -305,10 +305,10 @@ async def _upload_image(client: httpx.AsyncClient, headers: dict,
                 attempt + 1, _ASSET_POLL_ATTEMPTS, current_status,
             )
 
-            if current_status == "AVAILABLE":
+            if current_status in ("AVAILABLE", "ALLOWED"):
                 logger.info(
-                    "[linkedin_poster] Asset AVAILABLE after %ds",
-                    (attempt + 1) * _ASSET_POLL_INTERVAL,
+                    "[linkedin_poster] Asset %s after %ds",
+                    current_status, (attempt + 1) * _ASSET_POLL_INTERVAL,
                 )
                 return asset_urn
 
@@ -325,7 +325,7 @@ async def _upload_image(client: httpx.AsyncClient, headers: dict,
 
     total_wait = _ASSET_POLL_ATTEMPTS * _ASSET_POLL_INTERVAL
     raise TimeoutError(
-        f"LinkedIn image asset {asset_id} did not reach AVAILABLE status after "
+        f"LinkedIn image asset {asset_id} did not reach AVAILABLE/ALLOWED status after "
         f"{total_wait}s (last status: {last_status}). "
         f"Post will go out as text-only."
     )
