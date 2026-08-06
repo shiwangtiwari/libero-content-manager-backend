@@ -148,11 +148,14 @@ def claim_post_for_posting(post_id: str) -> bool:
     """
     db = get_supabase()
     try:
+        # Accept both 'approved' and 'scheduled' — posts can be in either
+        # state when the posting job fires. Using .in_() to match both.
+        # The atomic flip to 'failed' still works as the duplicate-post guard.
         result = (
             db.table("posts")
             .update({"status": "failed"})
             .eq("id", post_id)
-            .eq("status", "approved")   # Only succeeds if STILL approved
+            .in_("status", ["approved", "scheduled"])
             .execute()
         )
         # If the update matched a row, data will be non-empty
