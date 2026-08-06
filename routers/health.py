@@ -6,6 +6,17 @@ from db.queries import get_all_session_health
 router = APIRouter(prefix="/health", tags=["health"])
 
 
+@router.get("/ping")
+async def ping():
+    """
+    Ultra-lightweight keep-alive endpoint.
+    UptimeRobot hits this every 5 minutes to keep Railway awake 24/7.
+    No DB calls, no auth, instant response.
+    URL to monitor: https://libero-content-manager-backend-production.up.railway.app/health/ping
+    """
+    return {"ok": True}
+
+
 @router.get("")
 async def health_check():
     """Basic liveness probe — Railway, Vercel, and dashboard use this."""
