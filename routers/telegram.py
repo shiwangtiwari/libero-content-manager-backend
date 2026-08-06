@@ -738,10 +738,10 @@ async def handle_post_now(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     # Resolve which post to post
-    approved = queries.get_posts_by_status("approved")
+    approved = queries.get_posts_by_status(["approved", "scheduled"])
     if not approved:
         await update.message.reply_text(
-            "[ERROR] No approved posts found.\n\n"
+            "[ERROR] No approved or scheduled posts found.\n\n"
             "Approve a draft first with /approve, then run /post_now."
         )
         return
@@ -752,9 +752,9 @@ async def handle_post_now(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await update.message.reply_text(f"[ERROR] {err}")
             return
         post = queries.get_post_by_id(post_id)
-        if not post or post["status"] != "approved":
+        if not post or post["status"] not in ("approved", "scheduled"):
             await update.message.reply_text(
-                f"[ERROR] Post {context.args[0]} is not approved "
+                f"[ERROR] Post {context.args[0]} is not approved or scheduled "
                 f"(status: {post['status'] if post else 'not found'}).\n"
                 f"Run /approve first."
             )
